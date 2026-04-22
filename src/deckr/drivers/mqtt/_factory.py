@@ -1,0 +1,560 @@
+from __future__ import annotations
+
+import json
+import logging
+from collections.abc import Mapping
+from collections import defaultdict
+from dataclasses import dataclass
+from pathlib import Path
+from time import monotonic
+from typing import Any, Literal
+
+import aiomqtt
+import anyio
+import yaml
+from decouple import config as decouple_config
+from pydantic import BaseModel, Field, field_validator
+from watchfiles import Change, awatch
+
+from deckr.core.component import BaseComponent, RunContext
+from deckr.core.messaging import EventBus
+from deckr.core.mqtt import MqttGatewayConfig, QOS
+from deckr.hardware import events as hw_events
+from deckr.hardware.events import DeviceConnectedEvent, DeviceDisconnectedEvent
+
+from ._device import RemoteDevice
+
+logger = logging.getLogger(__name__)
+
+CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
+
+RemoteGesture = Literal[
+    "key_down",
+    "key_up",
+    "encoder_rotate",
+    "touch_tap",
+    "touch_swipe",
+]
+
+
+class RemoteMqttConfig(BaseModel):
+    hostname: str | None = None
+    port: int | None = None
+    username: str | None = None
+    password: str | None = None
+    topic: str
+    dedupe_ms: int = 250
+
+
+class DriverBrokerConfig(BaseModel):
+    hostname: str = ""
+    port: int = 1883
+    username: str | None = None
+    password: str | None = None
+
+
+class DriverConfig(BaseModel):
+    config_path: Path | None = None
+    broker: DriverBrokerConfig = Field(default_factory=DriverBrokerConfig)
+
+
+class RemoteEventMapping(BaseModel):
+    match: str
+    slot: str
+    gesture: RemoteGesture
+    direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
+
+    @field_validator("match", mode="before")
+    @classmethod
+    def _normalize_match(cls, value: Any) -> str:
+        # YAML treats unquoted "on"/"off" as booleans, which is surprising for
+        # common MQTT action values. Normalize those back to the expected strings.
+        if value is True:
+            return "on"
+        if value is False:
+            return "off"
+        return str(value)
+
+
+class RemoteConfig(BaseModel):
+    mqtt: RemoteMqttConfig
+    events: list[RemoteEventMapping] = Field(default_factory=list)
+
+
+class RemoteDeviceCandidate(BaseModel):
+    id: str
+    name: str
+    remote: RemoteConfig
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeRemoteMapping:
+    match: str
+    slot: str
+    gesture: RemoteGesture
+    direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
+
+    def to_hardware_event(self, device_id: str) -> hw_events.HardwareEvent:
+        if self.gesture == "key_down":
+            return hw_events.KeyDownEvent(device_id=device_id, key_id=self.slot)
+        if self.gesture == "key_up":
+            return hw_events.KeyUpEvent(device_id=device_id, key_id=self.slot)
+        if self.gesture == "encoder_rotate":
+            direction = self.direction
+            if direction not in {"clockwise", "counterclockwise"}:
+                raise ValueError(
+                    f"encoder_rotate mapping for {self.slot!r} requires direction"
+                )
+            return hw_events.DialRotateEvent(
+                device_id=device_id,
+                dial_id=self.slot,
+                direction=direction,
+            )
+        if self.gesture == "touch_tap":
+            return hw_events.TouchTapEvent(device_id=device_id, touch_id=self.slot)
+        if self.gesture == "touch_swipe":
+            direction = self.direction
+            if direction not in {"left", "right"}:
+                raise ValueError(
+                    f"touch_swipe mapping for {self.slot!r} requires direction"
+                )
+            return hw_events.TouchSwipeEvent(
+                device_id=device_id,
+                touch_id=self.slot,
+                direction=direction,
+            )
+        raise ValueError(f"Unsupported remote gesture: {self.gesture}")
+
+
+@dataclass(frozen=True, slots=True)
+class RemoteDeviceRuntime:
+    id: str
+    name: str
+    mqtt_hostname: str
+    mqtt_port: int
+    mqtt_username: str | None
+    mqtt_password: str | None
+    mqtt_topic: str
+    dedupe_ms: int
+    mappings: tuple[RuntimeRemoteMapping, ...]
+
+
+@dataclass(slots=True)
+class RunningRemoteDevice:
+    runtime: RemoteDeviceRuntime
+    cancel_scope: anyio.CancelScope
+    stopped: anyio.Event
+
+
+def _parse_coordinates(slot_id: str) -> hw_events.Coordinates:
+    parts = slot_id.split(",")
+    if len(parts) == 2 and all(part.strip("-").isdigit() for part in parts):
+        return hw_events.Coordinates(column=int(parts[0]), row=int(parts[1]))
+    return hw_events.Coordinates(column=0, row=0)
+
+
+def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
+    if "encoder_rotate" in gestures:
+        return "encoder"
+    if any(gesture.startswith("touch_") for gesture in gestures):
+        return "touch_strip"
+    return "button"
+
+
+def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_events.HWSlot]:
+    by_slot: dict[str, set[RemoteGesture]] = defaultdict(set)
+    for mapping in mappings:
+        by_slot[mapping.slot].add(mapping.gesture)
+    return [
+        hw_events.HWSlot(
+            id=slot_id,
+            coordinates=_parse_coordinates(slot_id),
+            image_format=None,
+            slot_type=_slot_type_for_gestures(gestures),
+            gestures=frozenset(gestures),
+        )
+        for slot_id, gestures in sorted(
+            by_slot.items(),
+            key=lambda item: (
+                _parse_coordinates(item[0]).row,
+                _parse_coordinates(item[0]).column,
+                item[0],
+            ),
+        )
+    ]
+
+
+def _extract_action_values(payload: bytes | str) -> list[str]:
+    if isinstance(payload, bytes):
+        raw = payload.decode("utf-8").strip()
+    else:
+        raw = payload.strip()
+
+    if not raw:
+        return []
+
+    values: list[str] = [raw]
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return values
+
+    if isinstance(data, str):
+        values.append(data)
+    elif isinstance(data, dict):
+        action = data.get("action")
+        if isinstance(action, str) and action:
+            values.append(action)
+
+    # Preserve order while dropping duplicates.
+    return list(dict.fromkeys(values))
+
+
+def load_mqtt_gateway_config(
+    config: Mapping[str, Any] | None = None,
+) -> MqttGatewayConfig:
+    """Defaults for remote MQTT broker fields, aligned with controller MqttGateway env."""
+    if config is not None:
+        driver_config = DriverConfig.model_validate(config)
+        return MqttGatewayConfig(
+            hostname=driver_config.broker.hostname,
+            port=driver_config.broker.port,
+            topic="",
+            username=driver_config.broker.username,
+            password=driver_config.broker.password,
+        )
+
+    hostname = decouple_config("MQTT_HOSTNAME", default="").strip()
+    topic = decouple_config("MQTT_TOPIC", default="").strip()
+    port = decouple_config("MQTT_PORT", default=1883, cast=int)
+    username = decouple_config("MQTT_USERNAME", default="").strip() or None
+    password = (
+        decouple_config("MQTT_PASSWORD", default="").strip() if username else None
+    )
+    return MqttGatewayConfig(
+        hostname=hostname,
+        port=port,
+        topic=topic,
+        username=username,
+        password=password,
+    )
+
+
+def load_driver_config(config: Mapping[str, Any] | None = None) -> DriverConfig:
+    driver_config = DriverConfig.model_validate(dict(config or {}))
+    config_path = driver_config.config_path or CONFIG_DIR
+    driver_config.config_path = Path(config_path).expanduser().resolve()
+    return driver_config
+
+
+class Deduper:
+    def __init__(self, dedupe_ms: int):
+        self._dedupe_ms = dedupe_ms
+        self._last_seen_at: dict[str, float] = {}
+
+    def should_emit(self, key: str) -> bool:
+        now = monotonic()
+        last_seen = self._last_seen_at.get(key)
+        self._last_seen_at[key] = now
+        if last_seen is None:
+            return True
+        return (now - last_seen) * 1000 >= self._dedupe_ms
+
+
+def _load_remote_device(
+    path: Path,
+    *,
+    default_mqtt: MqttGatewayConfig,
+) -> RemoteDeviceRuntime | None:
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception:
+        logger.exception("Failed to read remote config from %s", path)
+        return None
+
+    if not isinstance(data, dict) or "remote" not in data:
+        return None
+
+    try:
+        candidate = RemoteDeviceCandidate.model_validate(data)
+    except Exception:
+        logger.exception("Invalid remote device config in %s", path)
+        return None
+
+    mappings = tuple(
+        RuntimeRemoteMapping(
+            match=mapping.match,
+            slot=mapping.slot,
+            gesture=mapping.gesture,
+            direction=mapping.direction,
+        )
+        for mapping in candidate.remote.events
+    )
+    if not mappings:
+        logger.warning("Skipping remote config %s because it has no events", path)
+        return None
+
+    hostname = (
+        candidate.remote.mqtt.hostname.strip()
+        if candidate.remote.mqtt.hostname is not None
+        else default_mqtt.hostname
+    )
+    port = (
+        candidate.remote.mqtt.port
+        if candidate.remote.mqtt.port is not None
+        else default_mqtt.port
+    )
+    username = (
+        candidate.remote.mqtt.username
+        if candidate.remote.mqtt.username is not None
+        else default_mqtt.username
+    )
+    password = (
+        candidate.remote.mqtt.password
+        if candidate.remote.mqtt.password is not None
+        else default_mqtt.password
+    )
+    if not hostname:
+        logger.warning(
+            "Skipping remote config %s because no MQTT hostname is configured",
+            path,
+        )
+        return None
+
+    return RemoteDeviceRuntime(
+        id=candidate.id,
+        name=candidate.name,
+        mqtt_hostname=hostname,
+        mqtt_port=port,
+        mqtt_username=username,
+        mqtt_password=password,
+        mqtt_topic=candidate.remote.mqtt.topic,
+        dedupe_ms=max(candidate.remote.mqtt.dedupe_ms, 0),
+        mappings=mappings,
+    )
+
+
+def load_remote_devices(
+    config_dir: Path = CONFIG_DIR,
+    *,
+    default_mqtt: MqttGatewayConfig | None = None,
+) -> list[RemoteDeviceRuntime]:
+    devices: list[RemoteDeviceRuntime] = []
+    mqtt_defaults = default_mqtt or load_mqtt_gateway_config()
+    for pattern in ("*.yml", "*.yaml"):
+        for path in sorted(config_dir.glob(pattern)):
+            device = _load_remote_device(path, default_mqtt=mqtt_defaults)
+            if device is not None:
+                devices.append(device)
+    return devices
+
+
+def _yaml_filter(change: Change, path: str) -> bool:
+    return path.endswith(".yml") or path.endswith(".yaml")
+
+
+async def _forward_device_events(device: RemoteDevice, event_bus: EventBus) -> None:
+    async for event in device.subscribe():
+        await event_bus.send(event)
+
+
+async def _mqtt_loop(
+    runtime: RemoteDeviceRuntime,
+    device: RemoteDevice,
+    *,
+    hostname: str,
+    port: int,
+    username: str | None,
+    password: str | None,
+) -> None:
+    backoff = 1.0
+    deduper = Deduper(runtime.dedupe_ms)
+    mappings_by_value: dict[str, list[RuntimeRemoteMapping]] = defaultdict(list)
+    for mapping in runtime.mappings:
+        mappings_by_value[mapping.match].append(mapping)
+
+    cancelled_exc = anyio.get_cancelled_exc_class()
+    while True:
+        try:
+            async with aiomqtt.Client(
+                hostname,
+                port=port,
+                username=username,
+                password=password,
+            ) as client:
+                await client.subscribe(runtime.mqtt_topic, qos=QOS)
+                logger.info(
+                    "Remote device %s subscribed to MQTT topic %s",
+                    runtime.id,
+                    runtime.mqtt_topic,
+                )
+                backoff = 1.0
+                async for message in client.messages:
+                    values = _extract_action_values(message.payload)
+                    for value in values:
+                        matched = mappings_by_value.get(value, [])
+                        if not matched:
+                            continue
+                        if not deduper.should_emit(value):
+                            continue
+                        for mapping in matched:
+                            await device.emit(mapping.to_hardware_event(runtime.id))
+        except cancelled_exc:
+            raise
+        except Exception:
+            logger.exception(
+                "Remote device %s disconnected from MQTT; retrying in %.1fs",
+                runtime.id,
+                backoff,
+            )
+            await anyio.sleep(backoff)
+            backoff = min(backoff * 2.0, 10.0)
+
+
+async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None:
+    device = RemoteDevice(
+        device_id=runtime.id,
+        name=runtime.name,
+        slots=build_slots(
+            [
+                RemoteEventMapping(
+                    match=mapping.match,
+                    slot=mapping.slot,
+                    gesture=mapping.gesture,
+                    direction=mapping.direction,
+                )
+                for mapping in runtime.mappings
+            ]
+        ),
+    )
+
+    await event_bus.send(DeviceConnectedEvent(device_id=runtime.id, device=device))
+    try:
+
+        async def run_mqtt_loop() -> None:
+            await _mqtt_loop(
+                runtime,
+                device,
+                hostname=runtime.mqtt_hostname,
+                port=runtime.mqtt_port,
+                username=runtime.mqtt_username,
+                password=runtime.mqtt_password,
+            )
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_forward_device_events, device, event_bus)
+            tg.start_soon(run_mqtt_loop)
+    finally:
+        await device.close()
+        await event_bus.send(DeviceDisconnectedEvent(device_id=runtime.id))
+
+
+class RemoteDeviceFactoryComponent(BaseComponent):
+    def __init__(
+        self,
+        bus: EventBus,
+        *,
+        config_dir: Path = CONFIG_DIR,
+        default_mqtt: MqttGatewayConfig | None = None,
+    ):
+        super().__init__(name="remote_device_factory")
+        self._event_bus = bus
+        self._config_dir = config_dir
+        self._default_mqtt = default_mqtt or load_mqtt_gateway_config()
+        self._cancel_scope = None
+        self._task_group: anyio.abc.TaskGroup | None = None
+        self._stop_event: anyio.Event | None = None
+        self._running_devices: dict[str, RunningRemoteDevice] = {}
+
+    async def start(self, ctx: RunContext) -> None:
+        self._cancel_scope = ctx.tg.cancel_scope
+        self._task_group = ctx.tg
+        self._stop_event = anyio.Event()
+        await self._reconcile_devices()
+        ctx.tg.start_soon(self._watch_loop)
+        await anyio.sleep_forever()
+
+    async def stop(self) -> None:
+        if self._stop_event is not None:
+            self._stop_event.set()
+        if self._cancel_scope is not None:
+            self._cancel_scope.cancel()
+
+    async def _run_device(self, runtime: RemoteDeviceRuntime) -> None:
+        stopped = anyio.Event()
+        with anyio.CancelScope() as scope:
+            self._running_devices[runtime.id] = RunningRemoteDevice(
+                runtime=runtime,
+                cancel_scope=scope,
+                stopped=stopped,
+            )
+            try:
+                await device_loop(runtime, self._event_bus)
+            finally:
+                stopped.set()
+                current = self._running_devices.get(runtime.id)
+                if current is not None and current.stopped is stopped:
+                    del self._running_devices[runtime.id]
+
+    async def _stop_device(self, device_id: str) -> None:
+        running = self._running_devices.get(device_id)
+        if running is None:
+            return
+        running.cancel_scope.cancel()
+        await running.stopped.wait()
+
+    async def _start_device(self, runtime: RemoteDeviceRuntime) -> None:
+        if self._task_group is None:
+            return
+        self._task_group.start_soon(self._run_device, runtime)
+
+    async def _reconcile_devices(self) -> None:
+        desired = {
+            runtime.id: runtime
+            for runtime in load_remote_devices(
+                self._config_dir,
+                default_mqtt=self._default_mqtt,
+            )
+        }
+        running_ids = set(self._running_devices)
+        desired_ids = set(desired)
+
+        for device_id in running_ids - desired_ids:
+            await self._stop_device(device_id)
+
+        for device_id, runtime in desired.items():
+            current = self._running_devices.get(device_id)
+            if current is None:
+                await self._start_device(runtime)
+                continue
+            if current.runtime != runtime:
+                await self._stop_device(device_id)
+                await self._start_device(runtime)
+
+    async def _watch_loop(self) -> None:
+        if self._stop_event is None:
+            return
+        try:
+            async for _changes in awatch(
+                self._config_dir,
+                watch_filter=_yaml_filter,
+                recursive=False,
+                stop_event=self._stop_event,
+            ):
+                await self._reconcile_devices()
+        except anyio.get_cancelled_exc_class():
+            raise
+        except Exception:
+            logger.exception("Remote device config watch loop failed")
+
+
+def driver_factory(
+    event_bus: EventBus,
+    config: Mapping[str, Any] | None = None,
+):
+    driver_config = load_driver_config(config)
+    return RemoteDeviceFactoryComponent(
+        event_bus,
+        config_dir=driver_config.config_path or CONFIG_DIR,
+        default_mqtt=load_mqtt_gateway_config(config),
+    )
