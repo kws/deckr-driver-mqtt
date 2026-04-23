@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Mapping
 from collections import defaultdict
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from time import monotonic
@@ -12,15 +12,19 @@ from typing import Any, Literal
 import aiomqtt
 import anyio
 import yaml
+from deckr.core.component import BaseComponent, RunContext
+from deckr.core.components import (
+    ComponentContext,
+    ComponentDefinition,
+    ComponentManifest,
+)
+from deckr.core.messaging import EventBus
+from deckr.core.mqtt import QOS, MqttGatewayConfig
+from deckr.hardware import events as hw_events
+from deckr.hardware.events import DeviceConnectedEvent, DeviceDisconnectedEvent
 from decouple import config as decouple_config
 from pydantic import BaseModel, Field, field_validator
 from watchfiles import Change, awatch
-
-from deckr.core.component import BaseComponent, RunContext
-from deckr.core.messaging import EventBus
-from deckr.core.mqtt import MqttGatewayConfig, QOS
-from deckr.hardware import events as hw_events
-from deckr.hardware.events import DeviceConnectedEvent, DeviceDisconnectedEvent
 
 from ._device import RemoteDevice
 
@@ -558,3 +562,20 @@ def driver_factory(
         config_dir=driver_config.config_path or CONFIG_DIR,
         default_mqtt=load_mqtt_gateway_config(config),
     )
+
+
+def component_factory(context: ComponentContext):
+    return driver_factory(
+        context.require_lane("hardware_events"),
+        config=context.raw_config,
+    )
+
+
+component = ComponentDefinition(
+    manifest=ComponentManifest(
+        component_id="deckr.drivers.mqtt",
+        config_prefix="deckr.drivers.mqtt",
+        publishes=("hardware_events",),
+    ),
+    factory=component_factory,
+)

@@ -155,19 +155,20 @@ toml = [
 
 [[package]]
 name = "deckr"
-version = "0.3.0.dev0"
-source = { registry = "../deckr/dist" }
+version = "0.2.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "pydantic" },
 ]
+sdist = { url = "https://files.pythonhosted.org/packages/dd/e3/a86192c84e42e0868d7b2726364bcdcc82311a83b45185e67a110b3c4a08/deckr-0.2.0.tar.gz", hash = "sha256:d4090a88d2c094849708b56c6bd818fe235864f0683f61158badf3bda31642be", size = 98178, upload-time = "2026-04-22T08:49:13.639Z" }
 wheels = [
-    { path = "deckr-0.3.0.dev0-py3-none-any.whl" },
+    { url = "https://files.pythonhosted.org/packages/bb/c3/cdd9bfd3e3925f658fc821bf709c7e89f6cae9d29ef05accceac6d4c2278/deckr-0.2.0-py3-none-any.whl", hash = "sha256:4d5747cbe06a62515f1e0a08b45c5c8d828758d8356760eb103d3d32d949bdfc", size = 34318, upload-time = "2026-04-22T08:49:14.661Z" },
 ]
 
 [[package]]
 name = "deckr-driver-mqtt"
-version = "0.1.0"
+version = "0.2.0.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "aiomqtt" },

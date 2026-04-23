@@ -20,8 +20,8 @@ dependencies = [
     "watchfiles>=1.1.1,<2.0.0",
 ]
 
-[project.entry-points."deckr.drivers"]
-mqtt = "deckr.drivers.mqtt:driver_factory"
+[project.entry-points."deckr.components"]
+"deckr.drivers.mqtt" = "deckr.drivers.mqtt:component"
 
 [project.urls]
 Documentation = "https://github.com/kws/deckr-driver-mqtt#readme"
