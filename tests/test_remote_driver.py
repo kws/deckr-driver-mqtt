@@ -3,8 +3,8 @@ from pathlib import Path
 import anyio
 import pytest
 from deckr.core.component import RunContext
-from deckr.transports.bus import EventBus
 from deckr.hardware import events as hw_events
+from deckr.transports.bus import EventBus
 
 from deckr.drivers.mqtt._factory import (
     Deduper,

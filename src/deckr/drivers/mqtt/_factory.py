@@ -157,11 +157,11 @@ class RunningRemoteDevice:
     stopped: anyio.Event
 
 
-def _parse_coordinates(slot_id: str) -> hw_events.WireCoordinates:
+def _parse_coordinates(slot_id: str) -> hw_events.HardwareCoordinates:
     parts = slot_id.split(",")
     if len(parts) == 2 and all(part.strip("-").isdigit() for part in parts):
-        return hw_events.WireCoordinates(column=int(parts[0]), row=int(parts[1]))
-    return hw_events.WireCoordinates(column=0, row=0)
+        return hw_events.HardwareCoordinates(column=int(parts[0]), row=int(parts[1]))
+    return hw_events.HardwareCoordinates(column=0, row=0)
 
 
 def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
@@ -172,12 +172,12 @@ def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
     return "button"
 
 
-def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_events.WireHWSlot]:
+def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_events.HardwareSlot]:
     by_slot: dict[str, set[RemoteGesture]] = defaultdict(set)
     for mapping in mappings:
         by_slot[mapping.slot].add(mapping.gesture)
     return [
-        hw_events.WireHWSlot(
+        hw_events.HardwareSlot(
             id=slot_id,
             coordinates=_parse_coordinates(slot_id),
             image_format=None,
@@ -464,7 +464,7 @@ async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None
     await event_bus.send(
         hw_events.DeviceConnectedMessage(
             device_id=runtime.id,
-            device=hw_events.WireHWDevice(
+            device=hw_events.HardwareDevice(
                 id=device.id,
                 hid=device.hid,
                 slots=list(device.slots),

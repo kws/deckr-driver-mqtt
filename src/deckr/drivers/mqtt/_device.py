@@ -9,7 +9,7 @@ from deckr.hardware import events as hw_events
 class RemoteDevice:
     """Input-only live device backed by a remote MQTT topic."""
 
-    def __init__(self, *, device_id: str, name: str, slots: list[hw_events.WireHWSlot]):
+    def __init__(self, *, device_id: str, name: str, slots: list[hw_events.HardwareSlot]):
         self._device_id = device_id
         self._name = name
         self._hid = f"remote:{device_id}"
@@ -31,7 +31,7 @@ class RemoteDevice:
         return self._hid
 
     @property
-    def slots(self) -> list[hw_events.WireHWSlot]:
+    def slots(self) -> list[hw_events.HardwareSlot]:
         return self._slots
 
     async def set_image(self, slot_id: str, image: bytes) -> None:
