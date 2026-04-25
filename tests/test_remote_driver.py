@@ -3,12 +3,12 @@ from pathlib import Path
 import anyio
 import pytest
 from deckr.core.component import RunContext
-from deckr.core.messaging import EventBus
-from deckr.core.mqtt import MqttGatewayConfig
+from deckr.transports.bus import EventBus
 from deckr.hardware import events as hw_events
 
 from deckr.drivers.mqtt._factory import (
     Deduper,
+    MqttBrokerDefaults,
     RemoteDeviceFactoryComponent,
     RemoteEventMapping,
     RuntimeRemoteMapping,
@@ -44,9 +44,9 @@ def test_build_slots_infers_button_and_encoder_controls():
 
     assert [slot.id for slot in slots] == ["0,0", "3,0"]
     assert slots[0].slot_type == "button"
-    assert slots[0].gestures == frozenset({"key_up"})
+    assert slots[0].gestures == ("key_up",)
     assert slots[1].slot_type == "encoder"
-    assert slots[1].gestures == frozenset({"encoder_rotate"})
+    assert slots[1].gestures == ("encoder_rotate",)
 
 
 def test_mapping_builds_hardware_event():
@@ -58,7 +58,7 @@ def test_mapping_builds_hardware_event():
     )
     hw_event = mapping.to_hardware_event("remote-1")
 
-    assert isinstance(hw_event, hw_events.DialRotateEvent)
+    assert isinstance(hw_event, hw_events.DialRotateMessage)
     assert hw_event.device_id == "remote-1"
     assert hw_event.dial_id == "3,0"
     assert hw_event.direction == "counterclockwise"
@@ -95,10 +95,9 @@ remote:
 
     devices = load_remote_devices(
         tmp_path,
-        default_mqtt=MqttGatewayConfig(
+        default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",
             port=1883,
-            topic="",
             username=None,
             password=None,
         ),
@@ -133,10 +132,9 @@ remote:
 
     devices = load_remote_devices(
         tmp_path,
-        default_mqtt=MqttGatewayConfig(
+        default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",
             port=1883,
-            topic="",
             username=None,
             password=None,
         ),
@@ -187,10 +185,9 @@ remote:
     component = RemoteDeviceFactoryComponent(
         EventBus(),
         config_dir=tmp_path,
-        default_mqtt=MqttGatewayConfig(
+        default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",
             port=1883,
-            topic="",
             username=None,
             password=None,
         ),

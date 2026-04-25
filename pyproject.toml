@@ -13,7 +13,7 @@ authors = [
 ]
 requires-python = ">=3.11,<4.0.0"
 dependencies = [
-    "deckr>=0.2.0,<1.0.0",
+    "deckr>=0.3.0.dev0,<1.0.0",
     "aiomqtt>=2.0.0,<3.0.0",
     "python-decouple>=3.8,<4.0",
     "pyyaml>=6.0.3,<7.0.0",
@@ -37,6 +37,9 @@ dev = [
     "pytest-cov>=6.0.0,<7.0.0",
     "ruff>=0.14.14,<0.15.0",
 ]
+
+[tool.uv.sources]
+deckr = { workspace = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/deckr"]

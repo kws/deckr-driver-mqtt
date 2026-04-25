@@ -18,10 +18,8 @@ from deckr.core.components import (
     ComponentDefinition,
     ComponentManifest,
 )
-from deckr.core.messaging import EventBus
-from deckr.core.mqtt import QOS, MqttGatewayConfig
 from deckr.hardware import events as hw_events
-from deckr.hardware.events import DeviceConnectedEvent, DeviceDisconnectedEvent
+from deckr.transports.bus import EventBus
 from decouple import config as decouple_config
 from pydantic import BaseModel, Field, field_validator
 from watchfiles import Change, awatch
@@ -31,6 +29,7 @@ from ._device import RemoteDevice
 logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
+QOS = 2
 
 RemoteGesture = Literal[
     "key_down",
@@ -92,37 +91,45 @@ class RemoteDeviceCandidate(BaseModel):
 
 
 @dataclass(frozen=True, slots=True)
+class MqttBrokerDefaults:
+    hostname: str
+    port: int
+    username: str | None
+    password: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeRemoteMapping:
     match: str
     slot: str
     gesture: RemoteGesture
     direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
 
-    def to_hardware_event(self, device_id: str) -> hw_events.HardwareEvent:
+    def to_hardware_event(self, device_id: str) -> hw_events.HardwareInputMessage:
         if self.gesture == "key_down":
-            return hw_events.KeyDownEvent(device_id=device_id, key_id=self.slot)
+            return hw_events.KeyDownMessage(device_id=device_id, key_id=self.slot)
         if self.gesture == "key_up":
-            return hw_events.KeyUpEvent(device_id=device_id, key_id=self.slot)
+            return hw_events.KeyUpMessage(device_id=device_id, key_id=self.slot)
         if self.gesture == "encoder_rotate":
             direction = self.direction
             if direction not in {"clockwise", "counterclockwise"}:
                 raise ValueError(
                     f"encoder_rotate mapping for {self.slot!r} requires direction"
                 )
-            return hw_events.DialRotateEvent(
+            return hw_events.DialRotateMessage(
                 device_id=device_id,
                 dial_id=self.slot,
                 direction=direction,
             )
         if self.gesture == "touch_tap":
-            return hw_events.TouchTapEvent(device_id=device_id, touch_id=self.slot)
+            return hw_events.TouchTapMessage(device_id=device_id, touch_id=self.slot)
         if self.gesture == "touch_swipe":
             direction = self.direction
             if direction not in {"left", "right"}:
                 raise ValueError(
                     f"touch_swipe mapping for {self.slot!r} requires direction"
                 )
-            return hw_events.TouchSwipeEvent(
+            return hw_events.TouchSwipeMessage(
                 device_id=device_id,
                 touch_id=self.slot,
                 direction=direction,
@@ -150,11 +157,11 @@ class RunningRemoteDevice:
     stopped: anyio.Event
 
 
-def _parse_coordinates(slot_id: str) -> hw_events.Coordinates:
+def _parse_coordinates(slot_id: str) -> hw_events.WireCoordinates:
     parts = slot_id.split(",")
     if len(parts) == 2 and all(part.strip("-").isdigit() for part in parts):
-        return hw_events.Coordinates(column=int(parts[0]), row=int(parts[1]))
-    return hw_events.Coordinates(column=0, row=0)
+        return hw_events.WireCoordinates(column=int(parts[0]), row=int(parts[1]))
+    return hw_events.WireCoordinates(column=0, row=0)
 
 
 def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
@@ -165,17 +172,17 @@ def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
     return "button"
 
 
-def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_events.HWSlot]:
+def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_events.WireHWSlot]:
     by_slot: dict[str, set[RemoteGesture]] = defaultdict(set)
     for mapping in mappings:
         by_slot[mapping.slot].add(mapping.gesture)
     return [
-        hw_events.HWSlot(
+        hw_events.WireHWSlot(
             id=slot_id,
             coordinates=_parse_coordinates(slot_id),
             image_format=None,
             slot_type=_slot_type_for_gestures(gestures),
-            gestures=frozenset(gestures),
+            gestures=sorted(gestures),
         )
         for slot_id, gestures in sorted(
             by_slot.items(),
@@ -214,31 +221,28 @@ def _extract_action_values(payload: bytes | str) -> list[str]:
     return list(dict.fromkeys(values))
 
 
-def load_mqtt_gateway_config(
+def load_mqtt_broker_defaults(
     config: Mapping[str, Any] | None = None,
-) -> MqttGatewayConfig:
-    """Defaults for remote MQTT broker fields, aligned with controller MqttGateway env."""
+) -> MqttBrokerDefaults:
+    """Defaults for remote MQTT broker fields."""
     if config is not None:
         driver_config = DriverConfig.model_validate(config)
-        return MqttGatewayConfig(
+        return MqttBrokerDefaults(
             hostname=driver_config.broker.hostname,
             port=driver_config.broker.port,
-            topic="",
             username=driver_config.broker.username,
             password=driver_config.broker.password,
         )
 
     hostname = decouple_config("MQTT_HOSTNAME", default="").strip()
-    topic = decouple_config("MQTT_TOPIC", default="").strip()
     port = decouple_config("MQTT_PORT", default=1883, cast=int)
     username = decouple_config("MQTT_USERNAME", default="").strip() or None
     password = (
         decouple_config("MQTT_PASSWORD", default="").strip() if username else None
     )
-    return MqttGatewayConfig(
+    return MqttBrokerDefaults(
         hostname=hostname,
         port=port,
-        topic=topic,
         username=username,
         password=password,
     )
@@ -268,7 +272,7 @@ class Deduper:
 def _load_remote_device(
     path: Path,
     *,
-    default_mqtt: MqttGatewayConfig,
+    default_mqtt: MqttBrokerDefaults,
 ) -> RemoteDeviceRuntime | None:
     try:
         data = yaml.safe_load(path.read_text())
@@ -341,10 +345,10 @@ def _load_remote_device(
 def load_remote_devices(
     config_dir: Path = CONFIG_DIR,
     *,
-    default_mqtt: MqttGatewayConfig | None = None,
+    default_mqtt: MqttBrokerDefaults | None = None,
 ) -> list[RemoteDeviceRuntime]:
     devices: list[RemoteDeviceRuntime] = []
-    mqtt_defaults = default_mqtt or load_mqtt_gateway_config()
+    mqtt_defaults = default_mqtt or load_mqtt_broker_defaults()
     for pattern in ("*.yml", "*.yaml"):
         for path in sorted(config_dir.glob(pattern)):
             device = _load_remote_device(path, default_mqtt=mqtt_defaults)
@@ -360,6 +364,31 @@ def _yaml_filter(change: Change, path: str) -> bool:
 async def _forward_device_events(device: RemoteDevice, event_bus: EventBus) -> None:
     async for event in device.subscribe():
         await event_bus.send(event)
+
+
+async def _run_until_complete(cancel_scope, func, *args) -> None:
+    try:
+        await func(*args)
+    finally:
+        cancel_scope.cancel()
+
+
+async def _apply_device_commands(device: RemoteDevice, event_bus: EventBus) -> None:
+    async with event_bus.subscribe() as stream:
+        async for envelope in stream:
+            message = envelope.message
+            if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):
+                continue
+            if message.device_id != device.id:
+                continue
+            if isinstance(message, hw_events.SetImageMessage):
+                await device.set_image(message.slot_id, message.image)
+            elif isinstance(message, hw_events.ClearSlotMessage):
+                await device.clear_slot(message.slot_id)
+            elif isinstance(message, hw_events.SleepScreenMessage):
+                await device.sleep_screen()
+            elif isinstance(message, hw_events.WakeScreenMessage):
+                await device.wake_screen()
 
 
 async def _mqtt_loop(
@@ -432,7 +461,17 @@ async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None
         ),
     )
 
-    await event_bus.send(DeviceConnectedEvent(device_id=runtime.id, device=device))
+    await event_bus.send(
+        hw_events.DeviceConnectedMessage(
+            device_id=runtime.id,
+            device=hw_events.WireHWDevice(
+                id=device.id,
+                hid=device.hid,
+                slots=list(device.slots),
+                name=device.name,
+            ),
+        )
+    )
     try:
 
         async def run_mqtt_loop() -> None:
@@ -446,11 +485,24 @@ async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None
             )
 
         async with anyio.create_task_group() as tg:
-            tg.start_soon(_forward_device_events, device, event_bus)
-            tg.start_soon(run_mqtt_loop)
+            tg.start_soon(
+                _run_until_complete,
+                tg.cancel_scope,
+                _forward_device_events,
+                device,
+                event_bus,
+            )
+            tg.start_soon(
+                _run_until_complete,
+                tg.cancel_scope,
+                _apply_device_commands,
+                device,
+                event_bus,
+            )
+            tg.start_soon(_run_until_complete, tg.cancel_scope, run_mqtt_loop)
     finally:
         await device.close()
-        await event_bus.send(DeviceDisconnectedEvent(device_id=runtime.id))
+        await event_bus.send(hw_events.DeviceDisconnectedMessage(device_id=runtime.id))
 
 
 class RemoteDeviceFactoryComponent(BaseComponent):
@@ -459,12 +511,12 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         bus: EventBus,
         *,
         config_dir: Path = CONFIG_DIR,
-        default_mqtt: MqttGatewayConfig | None = None,
+        default_mqtt: MqttBrokerDefaults | None = None,
     ):
         super().__init__(name="remote_device_factory")
         self._event_bus = bus
         self._config_dir = config_dir
-        self._default_mqtt = default_mqtt or load_mqtt_gateway_config()
+        self._default_mqtt = default_mqtt or load_mqtt_broker_defaults()
         self._cancel_scope = None
         self._task_group: anyio.abc.TaskGroup | None = None
         self._stop_event: anyio.Event | None = None
@@ -560,7 +612,7 @@ def driver_factory(
     return RemoteDeviceFactoryComponent(
         event_bus,
         config_dir=driver_config.config_path or CONFIG_DIR,
-        default_mqtt=load_mqtt_gateway_config(config),
+        default_mqtt=load_mqtt_broker_defaults(config),
     )
 
 
@@ -575,6 +627,7 @@ component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="deckr.drivers.mqtt",
         config_prefix="deckr.drivers.mqtt",
+        consumes=("hardware_events",),
         publishes=("hardware_events",),
     ),
     factory=component_factory,
