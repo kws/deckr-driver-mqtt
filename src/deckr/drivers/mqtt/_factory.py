@@ -20,7 +20,7 @@ from deckr.components import (
     RunContext,
 )
 from deckr.contracts.messages import hardware_manager_address
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 from deckr.transports.bus import EventBus
 from decouple import config as decouple_config
 from pydantic import BaseModel, Field, field_validator
@@ -108,30 +108,30 @@ class RuntimeRemoteMapping:
     gesture: RemoteGesture
     direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
 
-    def to_hardware_event(self) -> hw_events.HardwareInputMessage:
+    def to_hardware_input(self) -> hw_messages.HardwareInputMessage:
         if self.gesture == "key_down":
-            return hw_events.KeyDownMessage(key_id=self.slot)
+            return hw_messages.KeyDownMessage(key_id=self.slot)
         if self.gesture == "key_up":
-            return hw_events.KeyUpMessage(key_id=self.slot)
+            return hw_messages.KeyUpMessage(key_id=self.slot)
         if self.gesture == "encoder_rotate":
             direction = self.direction
             if direction not in {"clockwise", "counterclockwise"}:
                 raise ValueError(
                     f"encoder_rotate mapping for {self.slot!r} requires direction"
                 )
-            return hw_events.DialRotateMessage(
+            return hw_messages.DialRotateMessage(
                 dial_id=self.slot,
                 direction=direction,
             )
         if self.gesture == "touch_tap":
-            return hw_events.TouchTapMessage(touch_id=self.slot)
+            return hw_messages.TouchTapMessage(touch_id=self.slot)
         if self.gesture == "touch_swipe":
             direction = self.direction
             if direction not in {"left", "right"}:
                 raise ValueError(
                     f"touch_swipe mapping for {self.slot!r} requires direction"
                 )
-            return hw_events.TouchSwipeMessage(
+            return hw_messages.TouchSwipeMessage(
                 touch_id=self.slot,
                 direction=direction,
             )
@@ -158,11 +158,11 @@ class RunningRemoteDevice:
     stopped: anyio.Event
 
 
-def _parse_coordinates(slot_id: str) -> hw_events.HardwareCoordinates:
+def _parse_coordinates(slot_id: str) -> hw_messages.HardwareCoordinates:
     parts = slot_id.split(",")
     if len(parts) == 2 and all(part.strip("-").isdigit() for part in parts):
-        return hw_events.HardwareCoordinates(column=int(parts[0]), row=int(parts[1]))
-    return hw_events.HardwareCoordinates(column=0, row=0)
+        return hw_messages.HardwareCoordinates(column=int(parts[0]), row=int(parts[1]))
+    return hw_messages.HardwareCoordinates(column=0, row=0)
 
 
 def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
@@ -173,12 +173,12 @@ def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
     return "button"
 
 
-def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_events.HardwareSlot]:
+def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_messages.HardwareSlot]:
     by_slot: dict[str, set[RemoteGesture]] = defaultdict(set)
     for mapping in mappings:
         by_slot[mapping.slot].add(mapping.gesture)
     return [
-        hw_events.HardwareSlot(
+        hw_messages.HardwareSlot(
             id=slot_id,
             coordinates=_parse_coordinates(slot_id),
             image_format=None,
@@ -369,7 +369,7 @@ async def _forward_device_events(
 ) -> None:
     async for event in device.subscribe():
         await event_bus.send(
-            hw_events.hardware_input_message(
+            hw_messages.hardware_input_message(
                 manager_id=manager_id,
                 device_id=device.id,
                 body=event,
@@ -391,22 +391,22 @@ async def _apply_device_commands(
 ) -> None:
     async with event_bus.subscribe() as stream:
         async for envelope in stream:
-            ref = hw_events.hardware_device_ref_from_message(envelope)
-            if ref != hw_events.HardwareDeviceRef(
+            ref = hw_messages.hardware_device_ref_from_message(envelope)
+            if ref != hw_messages.HardwareDeviceRef(
                 manager_id=manager_id,
                 device_id=device.id,
             ):
                 continue
-            message = hw_events.hardware_body_from_message(envelope)
-            if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):
+            message = hw_messages.hardware_body_from_message(envelope)
+            if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
                 continue
-            if isinstance(message, hw_events.SetImageMessage):
+            if isinstance(message, hw_messages.SetImageMessage):
                 await device.set_image(message.slot_id, message.image)
-            elif isinstance(message, hw_events.ClearSlotMessage):
+            elif isinstance(message, hw_messages.ClearSlotMessage):
                 await device.clear_slot(message.slot_id)
-            elif isinstance(message, hw_events.SleepScreenMessage):
+            elif isinstance(message, hw_messages.SleepScreenMessage):
                 await device.sleep_screen()
-            elif isinstance(message, hw_events.WakeScreenMessage):
+            elif isinstance(message, hw_messages.WakeScreenMessage):
                 await device.wake_screen()
 
 
@@ -450,7 +450,7 @@ async def _mqtt_loop(
                         if not deduper.should_emit(value):
                             continue
                         for mapping in matched:
-                            await device.emit(mapping.to_hardware_event())
+                            await device.emit(mapping.to_hardware_input())
         except cancelled_exc:
             raise
         except Exception:
@@ -485,11 +485,11 @@ async def device_loop(
     )
 
     await event_bus.send(
-        hw_events.hardware_input_message(
+        hw_messages.hardware_input_message(
             manager_id=manager_id,
             device_id=runtime.id,
-            body=hw_events.DeviceConnectedMessage(
-                device=hw_events.HardwareDevice(
+            body=hw_messages.DeviceConnectedMessage(
+                device=hw_messages.HardwareDevice(
                     id=device.id,
                     fingerprint=runtime.id,
                     hid=device.hid,
@@ -532,10 +532,10 @@ async def device_loop(
     finally:
         await device.close()
         await event_bus.send(
-            hw_events.hardware_input_message(
+            hw_messages.hardware_input_message(
                 manager_id=manager_id,
                 device_id=runtime.id,
-                body=hw_events.DeviceDisconnectedMessage(),
+                body=hw_messages.DeviceDisconnectedMessage(),
             )
         )
 
@@ -664,7 +664,7 @@ def driver_factory(
 
 def component_factory(context: ComponentContext):
     return driver_factory(
-        context.require_lane("hardware_events"),
+        context.require_lane("hardware_messages"),
         config=context.raw_config,
     )
 
@@ -673,8 +673,8 @@ component = ComponentDefinition(
     manifest=ComponentManifest(
         component_id="deckr.drivers.mqtt",
         config_prefix="deckr.drivers.mqtt",
-        consumes=("hardware_events",),
-        publishes=("hardware_events",),
+        consumes=("hardware_messages",),
+        publishes=("hardware_messages",),
     ),
     factory=component_factory,
 )

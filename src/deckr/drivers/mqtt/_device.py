@@ -3,19 +3,19 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 import anyio
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 
 
 class RemoteDevice:
     """Input-only live device backed by a remote MQTT topic."""
 
-    def __init__(self, *, device_id: str, name: str, slots: list[hw_events.HardwareSlot]):
+    def __init__(self, *, device_id: str, name: str, slots: list[hw_messages.HardwareSlot]):
         self._device_id = device_id
         self._name = name
         self._hid = f"remote:{device_id}"
         self._slots = slots
         self._event_send, self._event_receive = anyio.create_memory_object_stream[
-            hw_events.HardwareInputMessage
+            hw_messages.HardwareInputMessage
         ](max_buffer_size=100)
 
     @property
@@ -31,7 +31,7 @@ class RemoteDevice:
         return self._hid
 
     @property
-    def slots(self) -> list[hw_events.HardwareSlot]:
+    def slots(self) -> list[hw_messages.HardwareSlot]:
         return self._slots
 
     async def set_image(self, slot_id: str, image: bytes) -> None:
@@ -46,10 +46,10 @@ class RemoteDevice:
     async def wake_screen(self) -> None:
         return
 
-    async def emit(self, event: hw_events.HardwareInputMessage) -> None:
+    async def emit(self, event: hw_messages.HardwareInputMessage) -> None:
         await self._event_send.send(event)
 
-    async def subscribe(self) -> AsyncIterator[hw_events.HardwareInputMessage]:
+    async def subscribe(self) -> AsyncIterator[hw_messages.HardwareInputMessage]:
         try:
             async for event in self._event_receive:
                 yield event

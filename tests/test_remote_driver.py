@@ -3,7 +3,7 @@ from pathlib import Path
 import anyio
 import pytest
 from deckr.components import RunContext
-from deckr.hardware import events as hw_events
+from deckr.hardware import messages as hw_messages
 from deckr.transports.bus import EventBus
 
 from deckr.drivers.mqtt._factory import (
@@ -49,18 +49,18 @@ def test_build_slots_infers_button_and_encoder_controls():
     assert slots[1].gestures == ("encoder_rotate",)
 
 
-def test_mapping_builds_hardware_event():
+def test_mapping_builds_hardware_input():
     mapping = RuntimeRemoteMapping(
         match="brightness_step_down",
         slot="3,0",
         gesture="encoder_rotate",
         direction="counterclockwise",
     )
-    hw_event = mapping.to_hardware_event()
+    hw_input = mapping.to_hardware_input()
 
-    assert isinstance(hw_event, hw_events.DialRotateMessage)
-    assert hw_event.dial_id == "3,0"
-    assert hw_event.direction == "counterclockwise"
+    assert isinstance(hw_input, hw_messages.DialRotateMessage)
+    assert hw_input.dial_id == "3,0"
+    assert hw_input.direction == "counterclockwise"
 
 
 def test_deduper_suppresses_duplicate_actions_within_window():
@@ -183,7 +183,7 @@ remote:
     )
 
     component = RemoteDeviceFactoryComponent(
-        EventBus("hardware_events"),
+        EventBus("hardware_messages"),
         manager_id="mqtt-main",
         config_dir=tmp_path,
         default_mqtt=MqttBrokerDefaults(
