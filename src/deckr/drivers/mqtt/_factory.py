@@ -12,6 +12,7 @@ from typing import Any, Literal
 import aiomqtt
 import anyio
 import yaml
+from deckr.contracts.messages import hardware_manager_address
 from deckr.core.component import BaseComponent, RunContext
 from deckr.core.components import (
     ComponentContext,
@@ -389,9 +390,11 @@ async def _apply_device_commands(
 ) -> None:
     async with event_bus.subscribe() as stream:
         async for envelope in stream:
-            if hw_events.hardware_manager_id_from_message(envelope) != manager_id:
-                continue
-            if hw_events.subject_device_id(envelope.subject) != device.id:
+            ref = hw_events.hardware_device_ref_from_message(envelope)
+            if ref != hw_events.HardwareDeviceRef(
+                manager_id=manager_id,
+                device_id=device.id,
+            ):
                 continue
             message = hw_events.hardware_body_from_message(envelope)
             if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):
@@ -487,6 +490,7 @@ async def device_loop(
             body=hw_events.DeviceConnectedMessage(
                 device=hw_events.HardwareDevice(
                     id=device.id,
+                    fingerprint=runtime.id,
                     hid=device.hid,
                     slots=list(device.slots),
                     name=device.name,
@@ -555,12 +559,20 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         self._running_devices: dict[str, RunningRemoteDevice] = {}
 
     async def start(self, ctx: RunContext) -> None:
+        endpoint = str(hardware_manager_address(self._manager_id))
+        client_id = await self._event_bus.claim_local_endpoint(endpoint)
         self._cancel_scope = ctx.tg.cancel_scope
         self._task_group = ctx.tg
         self._stop_event = anyio.Event()
-        await self._reconcile_devices()
-        ctx.tg.start_soon(self._watch_loop)
-        await anyio.sleep_forever()
+        try:
+            await self._reconcile_devices()
+            ctx.tg.start_soon(self._watch_loop)
+            await anyio.sleep_forever()
+        finally:
+            await self._event_bus.withdraw_local_endpoint(
+                endpoint=endpoint,
+                client_id=client_id,
+            )
 
     async def stop(self) -> None:
         if self._stop_event is not None:
