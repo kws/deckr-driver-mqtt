@@ -56,10 +56,9 @@ def test_mapping_builds_hardware_event():
         gesture="encoder_rotate",
         direction="counterclockwise",
     )
-    hw_event = mapping.to_hardware_event("remote-1")
+    hw_event = mapping.to_hardware_event()
 
     assert isinstance(hw_event, hw_events.DialRotateMessage)
-    assert hw_event.device_id == "remote-1"
     assert hw_event.dial_id == "3,0"
     assert hw_event.direction == "counterclockwise"
 
@@ -173,7 +172,8 @@ remote:
 
     started_topics: list[str] = []
 
-    async def fake_device_loop(runtime, event_bus):
+    async def fake_device_loop(runtime, event_bus, manager_id):
+        assert manager_id == "mqtt-main"
         started_topics.append(runtime.mqtt_topic)
         await anyio.sleep_forever()
 
@@ -183,7 +183,8 @@ remote:
     )
 
     component = RemoteDeviceFactoryComponent(
-        EventBus(),
+        EventBus("hardware_events"),
+        manager_id="mqtt-main",
         config_dir=tmp_path,
         default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",

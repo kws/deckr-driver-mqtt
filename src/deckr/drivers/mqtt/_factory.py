@@ -57,6 +57,7 @@ class DriverBrokerConfig(BaseModel):
 
 
 class DriverConfig(BaseModel):
+    manager_id: str
     config_path: Path | None = None
     broker: DriverBrokerConfig = Field(default_factory=DriverBrokerConfig)
 
@@ -105,11 +106,11 @@ class RuntimeRemoteMapping:
     gesture: RemoteGesture
     direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
 
-    def to_hardware_event(self, device_id: str) -> hw_events.HardwareInputMessage:
+    def to_hardware_event(self) -> hw_events.HardwareInputMessage:
         if self.gesture == "key_down":
-            return hw_events.KeyDownMessage(device_id=device_id, key_id=self.slot)
+            return hw_events.KeyDownMessage(key_id=self.slot)
         if self.gesture == "key_up":
-            return hw_events.KeyUpMessage(device_id=device_id, key_id=self.slot)
+            return hw_events.KeyUpMessage(key_id=self.slot)
         if self.gesture == "encoder_rotate":
             direction = self.direction
             if direction not in {"clockwise", "counterclockwise"}:
@@ -117,12 +118,11 @@ class RuntimeRemoteMapping:
                     f"encoder_rotate mapping for {self.slot!r} requires direction"
                 )
             return hw_events.DialRotateMessage(
-                device_id=device_id,
                 dial_id=self.slot,
                 direction=direction,
             )
         if self.gesture == "touch_tap":
-            return hw_events.TouchTapMessage(device_id=device_id, touch_id=self.slot)
+            return hw_events.TouchTapMessage(touch_id=self.slot)
         if self.gesture == "touch_swipe":
             direction = self.direction
             if direction not in {"left", "right"}:
@@ -130,7 +130,6 @@ class RuntimeRemoteMapping:
                     f"touch_swipe mapping for {self.slot!r} requires direction"
                 )
             return hw_events.TouchSwipeMessage(
-                device_id=device_id,
                 touch_id=self.slot,
                 direction=direction,
             )
@@ -226,12 +225,12 @@ def load_mqtt_broker_defaults(
 ) -> MqttBrokerDefaults:
     """Defaults for remote MQTT broker fields."""
     if config is not None:
-        driver_config = DriverConfig.model_validate(config)
+        driver_config = DriverBrokerConfig.model_validate(dict(config.get("broker") or {}))
         return MqttBrokerDefaults(
-            hostname=driver_config.broker.hostname,
-            port=driver_config.broker.port,
-            username=driver_config.broker.username,
-            password=driver_config.broker.password,
+            hostname=driver_config.hostname,
+            port=driver_config.port,
+            username=driver_config.username,
+            password=driver_config.password,
         )
 
     hostname = decouple_config("MQTT_HOSTNAME", default="").strip()
@@ -361,9 +360,19 @@ def _yaml_filter(change: Change, path: str) -> bool:
     return path.endswith(".yml") or path.endswith(".yaml")
 
 
-async def _forward_device_events(device: RemoteDevice, event_bus: EventBus) -> None:
+async def _forward_device_events(
+    device: RemoteDevice,
+    event_bus: EventBus,
+    manager_id: str,
+) -> None:
     async for event in device.subscribe():
-        await event_bus.send(event)
+        await event_bus.send(
+            hw_events.hardware_input_message(
+                manager_id=manager_id,
+                device_id=device.id,
+                body=event,
+            )
+        )
 
 
 async def _run_until_complete(cancel_scope, func, *args) -> None:
@@ -373,13 +382,19 @@ async def _run_until_complete(cancel_scope, func, *args) -> None:
         cancel_scope.cancel()
 
 
-async def _apply_device_commands(device: RemoteDevice, event_bus: EventBus) -> None:
+async def _apply_device_commands(
+    device: RemoteDevice,
+    event_bus: EventBus,
+    manager_id: str,
+) -> None:
     async with event_bus.subscribe() as stream:
         async for envelope in stream:
-            message = envelope.message
-            if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):
+            if hw_events.hardware_manager_id_from_message(envelope) != manager_id:
                 continue
-            if message.device_id != device.id:
+            if hw_events.subject_device_id(envelope.subject) != device.id:
+                continue
+            message = hw_events.hardware_body_from_message(envelope)
+            if not isinstance(message, hw_events.HARDWARE_COMMAND_MESSAGE_TYPES):
                 continue
             if isinstance(message, hw_events.SetImageMessage):
                 await device.set_image(message.slot_id, message.image)
@@ -431,7 +446,7 @@ async def _mqtt_loop(
                         if not deduper.should_emit(value):
                             continue
                         for mapping in matched:
-                            await device.emit(mapping.to_hardware_event(runtime.id))
+                            await device.emit(mapping.to_hardware_event())
         except cancelled_exc:
             raise
         except Exception:
@@ -444,7 +459,11 @@ async def _mqtt_loop(
             backoff = min(backoff * 2.0, 10.0)
 
 
-async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None:
+async def device_loop(
+    runtime: RemoteDeviceRuntime,
+    event_bus: EventBus,
+    manager_id: str,
+) -> None:
     device = RemoteDevice(
         device_id=runtime.id,
         name=runtime.name,
@@ -462,13 +481,16 @@ async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None
     )
 
     await event_bus.send(
-        hw_events.DeviceConnectedMessage(
+        hw_events.hardware_input_message(
+            manager_id=manager_id,
             device_id=runtime.id,
-            device=hw_events.HardwareDevice(
-                id=device.id,
-                hid=device.hid,
-                slots=list(device.slots),
-                name=device.name,
+            body=hw_events.DeviceConnectedMessage(
+                device=hw_events.HardwareDevice(
+                    id=device.id,
+                    hid=device.hid,
+                    slots=list(device.slots),
+                    name=device.name,
+                ),
             ),
         )
     )
@@ -491,6 +513,7 @@ async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None
                 _forward_device_events,
                 device,
                 event_bus,
+                manager_id,
             )
             tg.start_soon(
                 _run_until_complete,
@@ -498,11 +521,18 @@ async def device_loop(runtime: RemoteDeviceRuntime, event_bus: EventBus) -> None
                 _apply_device_commands,
                 device,
                 event_bus,
+                manager_id,
             )
             tg.start_soon(_run_until_complete, tg.cancel_scope, run_mqtt_loop)
     finally:
         await device.close()
-        await event_bus.send(hw_events.DeviceDisconnectedMessage(device_id=runtime.id))
+        await event_bus.send(
+            hw_events.hardware_input_message(
+                manager_id=manager_id,
+                device_id=runtime.id,
+                body=hw_events.DeviceDisconnectedMessage(),
+            )
+        )
 
 
 class RemoteDeviceFactoryComponent(BaseComponent):
@@ -510,11 +540,13 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         self,
         bus: EventBus,
         *,
+        manager_id: str,
         config_dir: Path = CONFIG_DIR,
         default_mqtt: MqttBrokerDefaults | None = None,
     ):
         super().__init__(name="remote_device_factory")
         self._event_bus = bus
+        self._manager_id = manager_id
         self._config_dir = config_dir
         self._default_mqtt = default_mqtt or load_mqtt_broker_defaults()
         self._cancel_scope = None
@@ -545,7 +577,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 stopped=stopped,
             )
             try:
-                await device_loop(runtime, self._event_bus)
+                await device_loop(runtime, self._event_bus, self._manager_id)
             finally:
                 stopped.set()
                 current = self._running_devices.get(runtime.id)
@@ -611,6 +643,7 @@ def driver_factory(
     driver_config = load_driver_config(config)
     return RemoteDeviceFactoryComponent(
         event_bus,
+        manager_id=driver_config.manager_id,
         config_dir=driver_config.config_path or CONFIG_DIR,
         default_mqtt=load_mqtt_broker_defaults(config),
     )
