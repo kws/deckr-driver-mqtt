@@ -2,7 +2,7 @@ from pathlib import Path
 
 import anyio
 import pytest
-from deckr.core.component import RunContext
+from deckr.components import RunContext
 from deckr.hardware import events as hw_events
 from deckr.transports.bus import EventBus
 

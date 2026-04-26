@@ -12,13 +12,14 @@ from typing import Any, Literal
 import aiomqtt
 import anyio
 import yaml
-from deckr.contracts.messages import hardware_manager_address
-from deckr.core.component import BaseComponent, RunContext
-from deckr.core.components import (
+from deckr.components import (
+    BaseComponent,
     ComponentContext,
     ComponentDefinition,
     ComponentManifest,
+    RunContext,
 )
+from deckr.contracts.messages import hardware_manager_address
 from deckr.hardware import events as hw_events
 from deckr.transports.bus import EventBus
 from decouple import config as decouple_config
