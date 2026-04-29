@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from collections import defaultdict
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
 from typing import Any, Literal
@@ -19,9 +21,29 @@ from deckr.components import (
     ComponentManifest,
     RunContext,
 )
-from deckr.contracts.messages import hardware_manager_address
+from deckr.contracts.messages import (
+    DeckrMessage,
+    EndpointAddress,
+    EndpointTarget,
+    endpoint_target,
+    hardware_manager_address,
+)
 from deckr.hardware import messages as hw_messages
-from deckr.transports.bus import EventBus
+from deckr.lanes import EndpointLane, Lane
+from deckr.state import (
+    DeviceClaim,
+    EndpointPresence,
+    HardwareInventory,
+    HardwareInventoryDevice,
+    StateConflict,
+    StateStore,
+    StateUnavailable,
+    encode_key_token,
+    hardware_inventory_key,
+    parse_device_claim_key,
+    parse_presence_endpoint_key,
+    presence_endpoint_key,
+)
 from decouple import config as decouple_config
 from pydantic import BaseModel, Field, field_validator
 from watchfiles import Change, awatch
@@ -32,6 +54,19 @@ logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
 QOS = 2
+PRESENCE_HEARTBEAT_SECONDS = 5.0
+PRESENCE_TTL_SECONDS = 15
+_STATE_RECONCILE_SECONDS = 1.0
+_WATCH_RETRY_SECONDS = 1.0
+_CONTROLLER_PRESENCE_PREFIX = ".".join(
+    (
+        "presence",
+        "endpoint",
+        encode_key_token("hardware_messages"),
+        encode_key_token("controller"),
+        "",
+    )
+)
 
 RemoteGesture = Literal[
     "key_down",
@@ -156,6 +191,15 @@ class RunningRemoteDevice:
     runtime: RemoteDeviceRuntime
     cancel_scope: anyio.CancelScope
     stopped: anyio.Event
+
+
+@dataclass(frozen=True, slots=True)
+class ResetDeviceCommand:
+    pass
+
+
+DeviceCommand = DeckrMessage | ResetDeviceCommand
+InputPublisher = Callable[[DeckrMessage], Awaitable[None]]
 
 
 def _parse_coordinates(slot_id: str) -> hw_messages.HardwareCoordinates:
@@ -364,11 +408,11 @@ def _yaml_filter(change: Change, path: str) -> bool:
 
 async def _forward_device_events(
     device: RemoteDevice,
-    event_bus: EventBus,
+    publish_input: InputPublisher,
     manager_id: str,
 ) -> None:
     async for event in device.subscribe():
-        await event_bus.send(
+        await publish_input(
             hw_messages.hardware_input_message(
                 manager_id=manager_id,
                 device_id=device.id,
@@ -386,28 +430,32 @@ async def _run_until_complete(cancel_scope, func, *args) -> None:
 
 async def _apply_device_commands(
     device: RemoteDevice,
-    event_bus: EventBus,
+    command_stream: anyio.abc.ObjectReceiveStream[DeviceCommand],
     manager_id: str,
 ) -> None:
-    async with event_bus.subscribe() as stream:
-        async for envelope in stream:
-            ref = hw_messages.hardware_device_ref_from_message(envelope)
-            if ref != hw_messages.HardwareDeviceRef(
-                manager_id=manager_id,
-                device_id=device.id,
-            ):
-                continue
-            message = hw_messages.hardware_body_from_message(envelope)
-            if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
-                continue
-            if isinstance(message, hw_messages.SetImageMessage):
-                await device.set_image(message.slot_id, message.image)
-            elif isinstance(message, hw_messages.ClearSlotMessage):
-                await device.clear_slot(message.slot_id)
-            elif isinstance(message, hw_messages.SleepScreenMessage):
-                await device.sleep_screen()
-            elif isinstance(message, hw_messages.WakeScreenMessage):
-                await device.wake_screen()
+    async for command in command_stream:
+        if isinstance(command, ResetDeviceCommand):
+            for slot in device.slots:
+                await device.clear_slot(slot.id)
+            continue
+        envelope = command
+        ref = hw_messages.hardware_device_ref_from_message(envelope)
+        if ref != hw_messages.HardwareDeviceRef(
+            manager_id=manager_id,
+            device_id=device.id,
+        ):
+            continue
+        message = hw_messages.hardware_body_from_message(envelope)
+        if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
+            continue
+        if isinstance(message, hw_messages.SetImageMessage):
+            await device.set_image(message.slot_id, message.image)
+        elif isinstance(message, hw_messages.ClearSlotMessage):
+            await device.clear_slot(message.slot_id)
+        elif isinstance(message, hw_messages.SleepScreenMessage):
+            await device.sleep_screen()
+        elif isinstance(message, hw_messages.WakeScreenMessage):
+            await device.wake_screen()
 
 
 async def _mqtt_loop(
@@ -465,7 +513,8 @@ async def _mqtt_loop(
 
 async def device_loop(
     runtime: RemoteDeviceRuntime,
-    event_bus: EventBus,
+    publish_input: InputPublisher,
+    command_stream: anyio.abc.ObjectReceiveStream[DeviceCommand],
     manager_id: str,
 ) -> None:
     device = RemoteDevice(
@@ -484,21 +533,6 @@ async def device_loop(
         ),
     )
 
-    await event_bus.send(
-        hw_messages.hardware_input_message(
-            manager_id=manager_id,
-            device_id=runtime.id,
-            body=hw_messages.DeviceConnectedMessage(
-                device=hw_messages.HardwareDevice(
-                    id=device.id,
-                    fingerprint=runtime.id,
-                    hid=device.hid,
-                    slots=list(device.slots),
-                    name=device.name,
-                ),
-            ),
-        )
-    )
     try:
 
         async def run_mqtt_loop() -> None:
@@ -517,7 +551,7 @@ async def device_loop(
                 tg.cancel_scope,
                 _forward_device_events,
                 device,
-                event_bus,
+                publish_input,
                 manager_id,
             )
             tg.start_soon(
@@ -525,73 +559,94 @@ async def device_loop(
                 tg.cancel_scope,
                 _apply_device_commands,
                 device,
-                event_bus,
+                command_stream,
                 manager_id,
             )
             tg.start_soon(_run_until_complete, tg.cancel_scope, run_mqtt_loop)
     finally:
         await device.close()
-        await event_bus.send(
-            hw_messages.hardware_input_message(
-                manager_id=manager_id,
-                device_id=runtime.id,
-                body=hw_messages.DeviceDisconnectedMessage(),
-            )
-        )
 
 
 class RemoteDeviceFactoryComponent(BaseComponent):
     def __init__(
         self,
-        bus: EventBus,
+        hardware_lane: Lane,
+        state: StateStore,
         *,
         manager_id: str,
         config_dir: Path = CONFIG_DIR,
         default_mqtt: MqttBrokerDefaults | None = None,
     ):
         super().__init__(name="remote_device_factory")
-        self._event_bus = bus
+        self._hardware_lane = hardware_lane
+        self._state = state
         self._manager_id = manager_id
         self._config_dir = config_dir
         self._default_mqtt = default_mqtt or load_mqtt_broker_defaults()
-        self._cancel_scope = None
+        self._session_id = str(uuid.uuid4())
+        self._cancel_scope: anyio.CancelScope | None = None
+        self._endpoint: EndpointLane | None = None
         self._task_group: anyio.abc.TaskGroup | None = None
         self._stop_event: anyio.Event | None = None
         self._running_devices: dict[str, RunningRemoteDevice] = {}
+        self._devices: dict[str, hw_messages.HardwareDevice] = {}
+        self._claims: dict[str, DeviceClaim] = {}
+        self._controller_presence_sessions: dict[EndpointAddress, str] = {}
+        self._unroutable_devices: set[str] = set()
+        self._command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]] = {}
+        self._presence_revision: int | None = None
+        self._inventory_revision: int | None = None
+        self._routing_reconcile_lock = anyio.Lock()
 
     async def start(self, ctx: RunContext) -> None:
-        endpoint = str(hardware_manager_address(self._manager_id))
-        client_id = await self._event_bus.claim_local_endpoint(endpoint)
+        self._endpoint = self._hardware_lane.endpoint(
+            hardware_manager_address(self._manager_id)
+        )
         self._cancel_scope = ctx.tg.cancel_scope
         self._task_group = ctx.tg
         self._stop_event = anyio.Event()
-        try:
-            await self._reconcile_devices()
-            ctx.tg.start_soon(self._watch_loop)
-            await anyio.sleep_forever()
-        finally:
-            await self._event_bus.withdraw_local_endpoint(
-                endpoint=endpoint,
-                client_id=client_id,
-            )
+        await self._reconcile_devices()
+        ctx.tg.start_soon(self._presence_loop)
+        ctx.tg.start_soon(self._command_subscription_loop)
+        ctx.tg.start_soon(self._claim_watch_loop)
+        ctx.tg.start_soon(self._controller_presence_loop)
+        ctx.tg.start_soon(self._routing_reconciliation_loop)
+        ctx.tg.start_soon(self._watch_loop)
 
     async def stop(self) -> None:
-        if self._stop_event is not None:
-            self._stop_event.set()
-        if self._cancel_scope is not None:
-            self._cancel_scope.cancel()
+        with anyio.CancelScope(shield=True):
+            if self._stop_event is not None:
+                self._stop_event.set()
+            if self._cancel_scope is not None:
+                self._cancel_scope.cancel()
+            self._devices.clear()
+            self._claims.clear()
+            self._unroutable_devices.clear()
+            await self._withdraw_presence()
+            await self._withdraw_inventory()
 
     async def _run_device(self, runtime: RemoteDeviceRuntime) -> None:
         stopped = anyio.Event()
+        command_send, command_receive = anyio.create_memory_object_stream[
+            DeviceCommand
+        ](max_buffer_size=100)
         with anyio.CancelScope() as scope:
             self._running_devices[runtime.id] = RunningRemoteDevice(
                 runtime=runtime,
                 cancel_scope=scope,
                 stopped=stopped,
             )
+            self._command_streams[runtime.id] = command_send
             try:
-                await device_loop(runtime, self._event_bus, self._manager_id)
+                async with command_send, command_receive:
+                    await device_loop(
+                        runtime,
+                        self._handle_device_message,
+                        command_receive,
+                        self._manager_id,
+                    )
             finally:
+                self._command_streams.pop(runtime.id, None)
                 stopped.set()
                 current = self._running_devices.get(runtime.id)
                 if current is not None and current.stopped is stopped:
@@ -619,18 +674,33 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         }
         running_ids = set(self._running_devices)
         desired_ids = set(desired)
+        changed_ids = {
+            device_id
+            for device_id, runtime in desired.items()
+            if self._running_devices.get(device_id) is not None
+            and self._running_devices[device_id].runtime != runtime
+        }
 
-        for device_id in running_ids - desired_ids:
+        for device_id in sorted((running_ids - desired_ids) | changed_ids):
             await self._stop_device(device_id)
+
+        next_devices = {
+            device_id: _hardware_device_from_runtime(runtime)
+            for device_id, runtime in desired.items()
+        }
+        if next_devices != self._devices:
+            removed_devices = set(self._devices) - set(next_devices)
+            self._devices = next_devices
+            for device_id in removed_devices:
+                self._claims.pop(device_id, None)
+                self._unroutable_devices.discard(device_id)
+            await self._publish_inventory_safely()
 
         for device_id, runtime in desired.items():
             current = self._running_devices.get(device_id)
             if current is None:
                 await self._start_device(runtime)
                 continue
-            if current.runtime != runtime:
-                await self._stop_device(device_id)
-                await self._start_device(runtime)
 
     async def _watch_loop(self) -> None:
         if self._stop_event is None:
@@ -648,14 +718,399 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         except Exception:
             logger.exception("Remote device config watch loop failed")
 
+    async def _presence_loop(self) -> None:
+        if self._endpoint is None:
+            return
+        key = presence_endpoint_key(
+            lane=self._endpoint.lane.name,
+            endpoint=self._endpoint.endpoint,
+        )
+        while True:
+            try:
+                entry = await self._state.put(
+                    key,
+                    EndpointPresence(
+                        endpoint=self._endpoint.endpoint,
+                        lane=self._endpoint.lane.name,
+                        sessionId=self._session_id,
+                        timestamp=datetime.now(UTC),
+                        ttlSeconds=PRESENCE_TTL_SECONDS,
+                        metadata={"runtime": "deckr-driver-mqtt-python"},
+                    ),
+                    ttl=PRESENCE_TTL_SECONDS,
+                )
+                self._presence_revision = entry.revision
+                await self._publish_inventory_safely()
+            except StateUnavailable:
+                logger.warning(
+                    "MQTT manager current state is unavailable; heartbeat will retry",
+                    exc_info=True,
+                )
+            await anyio.sleep(PRESENCE_HEARTBEAT_SECONDS)
+
+    async def _withdraw_presence(self) -> None:
+        if self._endpoint is None:
+            return
+        revision = self._presence_revision
+        if revision is None:
+            return
+        key = presence_endpoint_key(
+            lane=self._endpoint.lane.name,
+            endpoint=self._endpoint.endpoint,
+        )
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._state.delete(key, revision=revision)
+                self._presence_revision = None
+            except StateConflict:
+                logger.debug("MQTT manager presence changed before withdrawal")
+            except StateUnavailable:
+                logger.warning("Failed to withdraw MQTT manager presence", exc_info=True)
+
+    async def _handle_device_message(self, message: DeckrMessage) -> None:
+        if self._endpoint is None:
+            return
+        event = hw_messages.hardware_body_from_message(message)
+        ref = hw_messages.hardware_device_ref_from_message(message)
+        if ref is None:
+            return
+        if not isinstance(event, hw_messages.HARDWARE_INPUT_MESSAGE_TYPES):
+            return
+        if isinstance(
+            event,
+            hw_messages.DeviceConnectedMessage | hw_messages.DeviceDisconnectedMessage,
+        ):
+            return
+        if ref.device_id not in self._devices:
+            logger.debug("Dropping input for unknown MQTT device %s", ref.device_id)
+            return
+        recipient = self._claim_recipient(ref.device_id)
+        if recipient is None:
+            logger.debug(
+                "Dropping unclaimed MQTT input for %s/%s",
+                ref.manager_id,
+                ref.device_id,
+            )
+            return
+        await self._endpoint.publish(
+            hw_messages.hardware_message(
+                sender=self._endpoint.endpoint,
+                recipient=endpoint_target(recipient),
+                message_type=message.message_type,
+                body=event,
+                subject=message.subject,
+                causation_id=message.causation_id,
+            )
+        )
+
+    async def _publish_inventory(self) -> None:
+        if self._endpoint is None:
+            return
+        entry = await self._state.put(
+            hardware_inventory_key(self._manager_id),
+            HardwareInventory(
+                managerId=self._manager_id,
+                managerEndpoint=self._endpoint.endpoint,
+                sessionId=self._session_id,
+                timestamp=datetime.now(UTC),
+                ttlSeconds=PRESENCE_TTL_SECONDS,
+                devices={
+                    device_id: HardwareInventoryDevice(
+                        deviceId=device_id,
+                        hardwareType=device.name or "mqtt-remote",
+                        fingerprint=device.fingerprint,
+                        descriptor=device.model_dump(
+                            by_alias=True,
+                            exclude_none=True,
+                            mode="json",
+                        ),
+                    )
+                    for device_id, device in sorted(self._devices.items())
+                },
+            ),
+            ttl=PRESENCE_TTL_SECONDS,
+        )
+        self._inventory_revision = entry.revision
+
+    async def _publish_inventory_safely(self) -> None:
+        try:
+            await self._publish_inventory()
+        except StateUnavailable:
+            logger.warning(
+                "MQTT inventory current state is unavailable; heartbeat will retry",
+                exc_info=True,
+            )
+
+    async def _withdraw_inventory(self) -> None:
+        revision = self._inventory_revision
+        if revision is None:
+            return
+        with anyio.CancelScope(shield=True):
+            try:
+                await self._state.delete(
+                    hardware_inventory_key(self._manager_id),
+                    revision=revision,
+                )
+                self._inventory_revision = None
+            except StateConflict:
+                logger.debug("MQTT inventory changed before withdrawal")
+            except StateUnavailable:
+                logger.warning("Failed to withdraw MQTT inventory", exc_info=True)
+
+    async def _claim_watch_loop(self) -> None:
+        prefix = f"claim.device.{encode_key_token(self._manager_id)}."
+        while True:
+            try:
+                async with self._state.watch(prefix) as stream:
+                    async for change in stream:
+                        parsed = parse_device_claim_key(change.key)
+                        if parsed is None:
+                            continue
+                        manager_id, _device_id = parsed
+                        if manager_id != self._manager_id:
+                            continue
+                        await self._reconcile_routing_current_state(
+                            reason="device claim watch"
+                        )
+            except StateUnavailable:
+                logger.warning(
+                    "MQTT device claim state is unavailable; watch will retry",
+                    exc_info=True,
+                )
+                await anyio.sleep(_WATCH_RETRY_SECONDS)
+
+    async def _controller_presence_loop(self) -> None:
+        while True:
+            try:
+                async with self._state.watch(_CONTROLLER_PRESENCE_PREFIX) as stream:
+                    async for change in stream:
+                        parsed = parse_presence_endpoint_key(change.key)
+                        if parsed is None:
+                            continue
+                        lane, endpoint = parsed
+                        if lane != "hardware_messages" or endpoint.family != "controller":
+                            continue
+                        await self._reconcile_routing_current_state(
+                            reason="controller presence watch"
+                        )
+            except StateUnavailable:
+                logger.warning(
+                    "Controller endpoint presence state is unavailable; watch will retry",
+                    exc_info=True,
+                )
+                await anyio.sleep(_WATCH_RETRY_SECONDS)
+
+    async def _routing_reconciliation_loop(self) -> None:
+        while True:
+            try:
+                await self._reconcile_routing_current_state(reason="broker snapshot")
+            except StateUnavailable:
+                logger.warning(
+                    "MQTT routing current state unavailable; reconciliation will retry",
+                    exc_info=True,
+                )
+            await anyio.sleep(_STATE_RECONCILE_SECONDS)
+
+    async def _reconcile_routing_current_state(self, *, reason: str) -> None:
+        async with self._routing_reconcile_lock:
+            await self._reconcile_routing_current_state_locked(reason=reason)
+
+    async def _reconcile_routing_current_state_locked(self, *, reason: str) -> None:
+        claim_prefix = f"claim.device.{encode_key_token(self._manager_id)}."
+        claim_entries = await self._state.items(claim_prefix)
+        presence_entries = await self._state.items(_CONTROLLER_PRESENCE_PREFIX)
+
+        next_claims: dict[str, DeviceClaim] = {}
+        invalid_claim_devices: set[str] = set()
+        next_controller_sessions: dict[EndpointAddress, str] = {}
+
+        for entry in claim_entries:
+            parsed = parse_device_claim_key(entry.key)
+            if parsed is None:
+                continue
+            manager_id, device_id = parsed
+            if manager_id != self._manager_id:
+                continue
+            try:
+                next_claims[device_id] = DeviceClaim.model_validate(entry.value)
+            except ValueError:
+                logger.warning("Ignoring invalid MQTT device claim %s", entry.key)
+                invalid_claim_devices.add(device_id)
+
+        for entry in presence_entries:
+            parsed = parse_presence_endpoint_key(entry.key)
+            if parsed is None:
+                continue
+            lane, endpoint = parsed
+            if lane != "hardware_messages" or endpoint.family != "controller":
+                continue
+            try:
+                presence = EndpointPresence.model_validate(entry.value)
+            except ValueError:
+                logger.warning("Ignoring invalid controller presence %s", entry.key)
+                continue
+            if presence.endpoint != endpoint or presence.lane != lane:
+                logger.warning(
+                    "Ignoring controller presence %s with mismatched payload",
+                    entry.key,
+                )
+                continue
+            next_controller_sessions[endpoint] = presence.session_id
+
+        logger.debug("Reconciling MQTT routing current state via %s", reason)
+        devices_to_reset = self._devices_to_reset_for_routing_snapshot(
+            next_claims,
+            next_controller_sessions,
+            invalid_claim_devices,
+        )
+        self._claims = next_claims
+        self._controller_presence_sessions = next_controller_sessions
+        self._unroutable_devices = {
+            device_id
+            for device_id, claim in next_claims.items()
+            if _claim_recipient(claim, next_controller_sessions) is None
+        }
+        for device_id in sorted(devices_to_reset):
+            await self._reset_device(device_id)
+
+    def _devices_to_reset_for_routing_snapshot(
+        self,
+        next_claims: dict[str, DeviceClaim],
+        next_controller_sessions: dict[EndpointAddress, str],
+        invalid_claim_devices: set[str],
+    ) -> set[str]:
+        devices_to_reset = set(invalid_claim_devices)
+        for device_id, old_claim in self._claims.items():
+            next_claim = next_claims.get(device_id)
+            if next_claim is None:
+                devices_to_reset.add(device_id)
+                continue
+            if _claim_route_identity(old_claim) != _claim_route_identity(next_claim):
+                devices_to_reset.add(device_id)
+                continue
+            if (
+                _claim_recipient(old_claim, self._controller_presence_sessions)
+                is not None
+                and _claim_recipient(next_claim, next_controller_sessions) is None
+            ):
+                devices_to_reset.add(device_id)
+
+        for device_id, next_claim in next_claims.items():
+            if (
+                device_id not in self._claims
+                and _claim_recipient(next_claim, next_controller_sessions) is None
+            ):
+                devices_to_reset.add(device_id)
+        return devices_to_reset
+
+    def _claim_recipient(self, device_id: str) -> EndpointAddress | None:
+        claim = self._claims.get(device_id)
+        if claim is None:
+            return None
+        return _claim_recipient(claim, self._controller_presence_sessions)
+
+    async def _reset_device(self, device_id: str) -> None:
+        stream = self._command_streams.get(device_id)
+        if stream is None:
+            return
+        try:
+            await stream.send(ResetDeviceCommand())
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            logger.debug("Could not reset closed MQTT device session %s", device_id)
+
+    async def _command_subscription_loop(self) -> None:
+        if self._endpoint is None:
+            return
+        async with self._endpoint.subscribe() as stream:
+            async for envelope in stream:
+                await self._route_command(envelope)
+
+    async def _route_command(self, envelope: DeckrMessage) -> None:
+        if self._endpoint is None:
+            return
+        if (
+            not isinstance(envelope.recipient, EndpointTarget)
+            or envelope.recipient.endpoint != self._endpoint.endpoint
+        ):
+            return
+        ref = hw_messages.hardware_device_ref_from_message(envelope)
+        if ref is None or ref.manager_id != self._manager_id:
+            return
+        message = hw_messages.hardware_body_from_message(envelope)
+        if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
+            return
+        if ref.device_id not in self._devices:
+            logger.debug(
+                "Dropping command for unknown MQTT device %s/%s",
+                ref.manager_id,
+                ref.device_id,
+            )
+            return
+        if self._claim_recipient(ref.device_id) != envelope.sender:
+            logger.debug(
+                "Dropping unroutable MQTT command for %s/%s from %s",
+                ref.manager_id,
+                ref.device_id,
+                envelope.sender,
+            )
+            return
+        command_stream = self._command_streams.get(ref.device_id)
+        if command_stream is None:
+            logger.debug(
+                "Dropping command for closed MQTT device %s/%s",
+                ref.manager_id,
+                ref.device_id,
+            )
+            return
+        await command_stream.send(envelope)
+
+
+def _hardware_device_from_runtime(
+    runtime: RemoteDeviceRuntime,
+) -> hw_messages.HardwareDevice:
+    slots = build_slots(
+        [
+            RemoteEventMapping(
+                match=mapping.match,
+                slot=mapping.slot,
+                gesture=mapping.gesture,
+                direction=mapping.direction,
+            )
+            for mapping in runtime.mappings
+        ]
+    )
+    return hw_messages.HardwareDevice(
+        id=runtime.id,
+        fingerprint=runtime.id,
+        hid=f"remote:{runtime.id}",
+        slots=slots,
+        name=runtime.name,
+    )
+
+
+def _claim_route_identity(claim: DeviceClaim) -> tuple[EndpointAddress, str]:
+    return claim.claimed_by_endpoint, claim.claimed_by_session_id
+
+
+def _claim_recipient(
+    claim: DeviceClaim,
+    controller_presence_sessions: dict[EndpointAddress, str],
+) -> EndpointAddress | None:
+    session_id = controller_presence_sessions.get(claim.claimed_by_endpoint)
+    if session_id != claim.claimed_by_session_id:
+        return None
+    return claim.claimed_by_endpoint
+
 
 def driver_factory(
-    event_bus: EventBus,
+    hardware_lane: Lane,
+    state: StateStore,
     config: Mapping[str, Any] | None = None,
 ):
     driver_config = load_driver_config(config)
     return RemoteDeviceFactoryComponent(
-        event_bus,
+        hardware_lane,
+        state,
         manager_id=driver_config.manager_id,
         config_dir=driver_config.config_path or CONFIG_DIR,
         default_mqtt=load_mqtt_broker_defaults(config),
@@ -665,6 +1120,7 @@ def driver_factory(
 def component_factory(context: ComponentContext):
     return driver_factory(
         context.require_lane("hardware_messages"),
+        context.state(),
         config=context.raw_config,
     )
 
