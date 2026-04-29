@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import uuid
@@ -29,6 +30,18 @@ from deckr.contracts.messages import (
     hardware_manager_address,
 )
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import (
+    DECKR_INPUT_BUTTON,
+    DECKR_INPUT_ENCODER,
+    DECKR_INPUT_TOUCH,
+    CapabilityDescriptor,
+    CapabilitySchema,
+    ControlDescriptor,
+    ControlGeometry,
+    DeviceConnection,
+    DeviceDescriptor,
+    DeviceRef,
+)
 from deckr.lanes import EndpointLane, Lane
 from deckr.state import (
     DeviceClaim,
@@ -48,7 +61,7 @@ from decouple import config as decouple_config
 from pydantic import BaseModel, Field, field_validator
 from watchfiles import Change, awatch
 
-from ._device import RemoteDevice
+from ._device import ControlInputEvent, RemoteDevice
 
 logger = logging.getLogger(__name__)
 
@@ -143,32 +156,68 @@ class RuntimeRemoteMapping:
     gesture: RemoteGesture
     direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
 
-    def to_hardware_input(self) -> hw_messages.HardwareInputMessage:
+    def to_control_input_events(self) -> tuple[ControlInputEvent, ...]:
         if self.gesture == "key_down":
-            return hw_messages.KeyDownMessage(key_id=self.slot)
+            return (
+                ControlInputEvent(
+                    control_id=self.slot,
+                    capability_id="button.momentary",
+                    event_type="down",
+                    value={"eventType": "down"},
+                ),
+            )
         if self.gesture == "key_up":
-            return hw_messages.KeyUpMessage(key_id=self.slot)
+            return (
+                ControlInputEvent(
+                    control_id=self.slot,
+                    capability_id="button.momentary",
+                    event_type="up",
+                    value={"eventType": "up"},
+                ),
+                ControlInputEvent(
+                    control_id=self.slot,
+                    capability_id="button.press",
+                    event_type="press",
+                    value={"eventType": "press"},
+                ),
+            )
         if self.gesture == "encoder_rotate":
             direction = self.direction
             if direction not in {"clockwise", "counterclockwise"}:
                 raise ValueError(
                     f"encoder_rotate mapping for {self.slot!r} requires direction"
                 )
-            return hw_messages.DialRotateMessage(
-                dial_id=self.slot,
-                direction=direction,
+            delta = 1 if direction == "clockwise" else -1
+            return (
+                ControlInputEvent(
+                    control_id=self.slot,
+                    capability_id="encoder.relative",
+                    event_type="rotate",
+                    value={"delta": delta, "direction": direction},
+                ),
             )
         if self.gesture == "touch_tap":
-            return hw_messages.TouchTapMessage(touch_id=self.slot)
+            return (
+                ControlInputEvent(
+                    control_id=self.slot,
+                    capability_id="touch.gesture",
+                    event_type="tap",
+                    value={"eventType": "tap"},
+                ),
+            )
         if self.gesture == "touch_swipe":
             direction = self.direction
             if direction not in {"left", "right"}:
                 raise ValueError(
                     f"touch_swipe mapping for {self.slot!r} requires direction"
                 )
-            return hw_messages.TouchSwipeMessage(
-                touch_id=self.slot,
-                direction=direction,
+            return (
+                ControlInputEvent(
+                    control_id=self.slot,
+                    capability_id="touch.gesture",
+                    event_type="swipe",
+                    value={"eventType": "swipe", "direction": direction},
+                ),
             )
         raise ValueError(f"Unsupported remote gesture: {self.gesture}")
 
@@ -202,11 +251,11 @@ DeviceCommand = DeckrMessage | ResetDeviceCommand
 InputPublisher = Callable[[DeckrMessage], Awaitable[None]]
 
 
-def _parse_coordinates(slot_id: str) -> hw_messages.HardwareCoordinates:
+def _parse_coordinates(slot_id: str) -> tuple[int, int]:
     parts = slot_id.split(",")
     if len(parts) == 2 and all(part.strip("-").isdigit() for part in parts):
-        return hw_messages.HardwareCoordinates(column=int(parts[0]), row=int(parts[1]))
-    return hw_messages.HardwareCoordinates(column=0, row=0)
+        return int(parts[0]), int(parts[1])
+    return 0, 0
 
 
 def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
@@ -217,27 +266,165 @@ def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
     return "button"
 
 
-def build_slots(mappings: list[RemoteEventMapping]) -> list[hw_messages.HardwareSlot]:
+def _button_value_schema(events: tuple[str, ...], schema_id: str) -> CapabilitySchema:
+    return CapabilitySchema.model_validate(
+        {
+            "schemaId": schema_id,
+            "schema": {
+                "type": "object",
+                "required": ["eventType"],
+                "properties": {"eventType": {"enum": list(events)}},
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def _encoder_value_schema() -> CapabilitySchema:
+    return CapabilitySchema.model_validate(
+        {
+            "schemaId": "deckr.value.input.encoder.relative.v1",
+            "schema": {
+                "type": "object",
+                "required": ["delta"],
+                "properties": {
+                    "delta": {"type": "integer"},
+                    "direction": {"enum": ["clockwise", "counterclockwise"]},
+                },
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def _touch_value_schema() -> CapabilitySchema:
+    return CapabilitySchema.model_validate(
+        {
+            "schemaId": "deckr.value.input.touch.gesture.v1",
+            "schema": {
+                "type": "object",
+                "required": ["eventType"],
+                "properties": {
+                    "eventType": {"enum": ["tap", "swipe"]},
+                    "direction": {"enum": ["left", "right"]},
+                },
+                "additionalProperties": False,
+            },
+        }
+    )
+
+
+def _momentary_button_capability() -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        capabilityId="button.momentary",
+        family=DECKR_INPUT_BUTTON,
+        type="momentary",
+        direction="input",
+        access=("emits",),
+        valueSchema=_button_value_schema(
+            ("down", "up"),
+            "deckr.value.input.button.momentary.v1",
+        ),
+        eventTypes=("down", "up"),
+    )
+
+
+def _activation_button_capability(control_id: str) -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        capabilityId="button.press",
+        family=DECKR_INPUT_BUTTON,
+        type="activation",
+        direction="input",
+        access=("emits",),
+        valueSchema=_button_value_schema(
+            ("press",),
+            "deckr.value.input.button.activation.v1",
+        ),
+        eventTypes=("press",),
+        projection={
+            "owner": "hardware_manager",
+            "source": {
+                "controlId": control_id,
+                "capabilityId": "button.momentary",
+            },
+        },
+    )
+
+
+def _encoder_capability() -> CapabilityDescriptor:
+    return CapabilityDescriptor.model_validate(
+        {
+            "capabilityId": "encoder.relative",
+            "family": DECKR_INPUT_ENCODER,
+            "type": "relative",
+            "direction": "input",
+            "access": ["emits"],
+            "valueSchema": _encoder_value_schema().model_dump(
+                by_alias=True,
+                exclude_none=True,
+                mode="json",
+            ),
+            "eventTypes": ["rotate"],
+            "constraints": [
+                {
+                    "type": "range",
+                    "subject": "delta",
+                    "minimum": -24,
+                    "maximum": 24,
+                    "step": 1,
+                    "unit": "detent",
+                }
+            ],
+            "units": [{"subject": "delta", "unit": "detent"}],
+        }
+    )
+
+
+def _touch_capability() -> CapabilityDescriptor:
+    return CapabilityDescriptor(
+        capabilityId="touch.gesture",
+        family=DECKR_INPUT_TOUCH,
+        type="gesture",
+        direction="input",
+        access=("emits",),
+        valueSchema=_touch_value_schema(),
+        eventTypes=("tap", "swipe"),
+    )
+
+
+def build_controls(mappings: list[RemoteEventMapping]) -> list[ControlDescriptor]:
     by_slot: dict[str, set[RemoteGesture]] = defaultdict(set)
     for mapping in mappings:
         by_slot[mapping.slot].add(mapping.gesture)
-    return [
-        hw_messages.HardwareSlot(
-            id=slot_id,
-            coordinates=_parse_coordinates(slot_id),
-            image_format=None,
-            slot_type=_slot_type_for_gestures(gestures),
-            gestures=sorted(gestures),
+    controls = []
+    for slot_id, gestures in sorted(
+        by_slot.items(),
+        key=lambda item: (
+            _parse_coordinates(item[0])[1],
+            _parse_coordinates(item[0])[0],
+            item[0],
+        ),
+    ):
+        column, row = _parse_coordinates(slot_id)
+        capabilities: list[CapabilityDescriptor] = []
+        if "key_down" in gestures or "key_up" in gestures:
+            capabilities.append(_momentary_button_capability())
+            capabilities.append(_activation_button_capability(slot_id))
+        if "encoder_rotate" in gestures:
+            capabilities.append(_encoder_capability())
+        if any(gesture.startswith("touch_") for gesture in gestures):
+            capabilities.append(_touch_capability())
+        controls.append(
+            ControlDescriptor(
+                controlId=slot_id,
+                kind=_slot_type_for_gestures(gestures),
+                label=slot_id,
+                geometry=ControlGeometry(x=column, y=row, width=1, height=1, unit="grid"),
+                inputCapabilities=tuple(capabilities),
+                sources=(),
+            )
         )
-        for slot_id, gestures in sorted(
-            by_slot.items(),
-            key=lambda item: (
-                _parse_coordinates(item[0]).row,
-                _parse_coordinates(item[0]).column,
-                item[0],
-            ),
-        )
-    ]
+    return controls
 
 
 def _extract_action_values(payload: bytes | str) -> list[str]:
@@ -413,10 +600,14 @@ async def _forward_device_events(
 ) -> None:
     async for event in device.subscribe():
         await publish_input(
-            hw_messages.hardware_input_message(
+            hw_messages.control_input_message(
                 manager_id=manager_id,
                 device_id=device.id,
-                body=event,
+                fingerprint=device.hid,
+                control_id=event.control_id,
+                capability_id=event.capability_id,
+                event_type=event.event_type,
+                value=event.value,
             )
         )
 
@@ -435,27 +626,22 @@ async def _apply_device_commands(
 ) -> None:
     async for command in command_stream:
         if isinstance(command, ResetDeviceCommand):
-            for slot in device.slots:
-                await device.clear_slot(slot.id)
             continue
         envelope = command
         ref = hw_messages.hardware_device_ref_from_message(envelope)
-        if ref != hw_messages.HardwareDeviceRef(
-            manager_id=manager_id,
-            device_id=device.id,
-        ):
+        if ref is None or ref.manager_id != manager_id or ref.device_id != device.id:
             continue
         message = hw_messages.hardware_body_from_message(envelope)
-        if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
+        if not isinstance(message, hw_messages.ControlCommandMessage):
             continue
-        if isinstance(message, hw_messages.SetImageMessage):
-            await device.set_image(message.slot_id, message.image)
-        elif isinstance(message, hw_messages.ClearSlotMessage):
-            await device.clear_slot(message.slot_id)
-        elif isinstance(message, hw_messages.SleepScreenMessage):
-            await device.sleep_screen()
-        elif isinstance(message, hw_messages.WakeScreenMessage):
-            await device.wake_screen()
+        if message.capability_id != "raster.bitmap" or message.control_id is None:
+            continue
+        if message.command_type == "set_frame":
+            encoded = message.params.get("image")
+            if isinstance(encoded, str):
+                await device.set_image(message.control_id, base64.b64decode(encoded))
+        elif message.command_type == "clear":
+            await device.clear_slot(message.control_id)
 
 
 async def _mqtt_loop(
@@ -498,7 +684,8 @@ async def _mqtt_loop(
                         if not deduper.should_emit(value):
                             continue
                         for mapping in matched:
-                            await device.emit(mapping.to_hardware_input())
+                            for event in mapping.to_control_input_events():
+                                await device.emit(event)
         except cancelled_exc:
             raise
         except Exception:
@@ -520,17 +707,6 @@ async def device_loop(
     device = RemoteDevice(
         device_id=runtime.id,
         name=runtime.name,
-        slots=build_slots(
-            [
-                RemoteEventMapping(
-                    match=mapping.match,
-                    slot=mapping.slot,
-                    gesture=mapping.gesture,
-                    direction=mapping.direction,
-                )
-                for mapping in runtime.mappings
-            ]
-        ),
     )
 
     try:
@@ -589,7 +765,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         self._task_group: anyio.abc.TaskGroup | None = None
         self._stop_event: anyio.Event | None = None
         self._running_devices: dict[str, RunningRemoteDevice] = {}
-        self._devices: dict[str, hw_messages.HardwareDevice] = {}
+        self._devices: dict[str, DeviceDescriptor] = {}
         self._claims: dict[str, DeviceClaim] = {}
         self._controller_presence_sessions: dict[EndpointAddress, str] = {}
         self._unroutable_devices: set[str] = set()
@@ -690,11 +866,36 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         }
         if next_devices != self._devices:
             removed_devices = set(self._devices) - set(next_devices)
+            previous_devices = self._devices
             self._devices = next_devices
             for device_id in removed_devices:
                 self._claims.pop(device_id, None)
                 self._unroutable_devices.discard(device_id)
             await self._publish_inventory_safely()
+            if self._endpoint is not None:
+                for device_id in sorted(removed_devices):
+                    await self._endpoint.publish(
+                        hw_messages.device_unavailable_message(
+                            manager_id=self._manager_id,
+                            device_id=device_id,
+                            reason="removed",
+                        )
+                    )
+                for device_id, descriptor in sorted(next_devices.items()):
+                    if device_id not in previous_devices:
+                        await self._endpoint.publish(
+                            hw_messages.device_available_message(
+                                manager_id=self._manager_id,
+                                descriptor=descriptor,
+                            )
+                        )
+                    elif previous_devices[device_id] != descriptor:
+                        await self._endpoint.publish(
+                            hw_messages.device_descriptor_changed_message(
+                                manager_id=self._manager_id,
+                                descriptor=descriptor,
+                            )
+                        )
 
         for device_id, runtime in desired.items():
             current = self._running_devices.get(device_id)
@@ -774,11 +975,9 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         ref = hw_messages.hardware_device_ref_from_message(message)
         if ref is None:
             return
-        if not isinstance(event, hw_messages.HARDWARE_INPUT_MESSAGE_TYPES):
-            return
-        if isinstance(
+        if not isinstance(
             event,
-            hw_messages.DeviceConnectedMessage | hw_messages.DeviceDisconnectedMessage,
+            hw_messages.ControlInputMessage | hw_messages.CapabilityStateChangedMessage,
         ):
             return
         if ref.device_id not in self._devices:
@@ -816,14 +1015,12 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 ttlSeconds=PRESENCE_TTL_SECONDS,
                 devices={
                     device_id: HardwareInventoryDevice(
-                        deviceId=device_id,
-                        hardwareType=device.name or "mqtt-remote",
-                        fingerprint=device.fingerprint,
-                        descriptor=device.model_dump(
-                            by_alias=True,
-                            exclude_none=True,
-                            mode="json",
+                        deviceRef=DeviceRef(
+                            managerId=self._manager_id,
+                            deviceId=device_id,
+                            fingerprint=device.fingerprint,
                         ),
+                        descriptor=device,
                     )
                     for device_id, device in sorted(self._devices.items())
                 },
@@ -1037,7 +1234,10 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         if ref is None or ref.manager_id != self._manager_id:
             return
         message = hw_messages.hardware_body_from_message(envelope)
-        if not isinstance(message, hw_messages.HARDWARE_COMMAND_MESSAGE_TYPES):
+        if not isinstance(
+            message,
+            hw_messages.ControlCommandMessage | hw_messages.CapabilityStateRequestMessage,
+        ):
             return
         if ref.device_id not in self._devices:
             logger.debug(
@@ -1067,8 +1267,8 @@ class RemoteDeviceFactoryComponent(BaseComponent):
 
 def _hardware_device_from_runtime(
     runtime: RemoteDeviceRuntime,
-) -> hw_messages.HardwareDevice:
-    slots = build_slots(
+) -> DeviceDescriptor:
+    controls = build_controls(
         [
             RemoteEventMapping(
                 match=mapping.match,
@@ -1079,12 +1279,22 @@ def _hardware_device_from_runtime(
             for mapping in runtime.mappings
         ]
     )
-    return hw_messages.HardwareDevice(
-        id=runtime.id,
+    return DeviceDescriptor(
+        deviceId=runtime.id,
         fingerprint=runtime.id,
-        hid=f"remote:{runtime.id}",
-        slots=slots,
-        name=runtime.name,
+        displayName=runtime.name,
+        manufacturer="Deckr",
+        model="MQTT Remote",
+        connections=(
+            DeviceConnection(
+                connectionId=f"mqtt-{runtime.id}",
+                type="mqtt",
+                status="available",
+                transport="mqtt",
+                facts={"topic": runtime.mqtt_topic},
+            ),
+        ),
+        controls=tuple(controls),
     )
 
 

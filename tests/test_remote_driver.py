@@ -1,3 +1,4 @@
+import base64
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -7,6 +8,7 @@ import pytest
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, LaneContractRegistry
 from deckr.contracts.messages import controller_address, hardware_manager_address
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.descriptors import CapabilityRef, DeviceRef
 from deckr.runtime import Deckr
 from deckr.state import (
     DeviceClaim,
@@ -26,7 +28,7 @@ from deckr.drivers.mqtt._factory import (
     RuntimeRemoteMapping,
     _apply_device_commands,
     _extract_action_values,
-    build_slots,
+    build_controls,
     load_remote_devices,
 )
 
@@ -110,6 +112,35 @@ remote:
     )
 
 
+def _input_message() -> hw_messages.ControlInputMessage:
+    return hw_messages.control_input_message(
+        manager_id="mqtt-main",
+        device_id="remote-0x0330",
+        fingerprint="remote-0x0330",
+        control_id="0,0",
+        capability_id="button.momentary",
+        event_type="up",
+        value={"eventType": "up"},
+    )
+
+
+def _command_message(controller_id: str, image: bytes) -> hw_messages.ControlCommandMessage:
+    return hw_messages.control_command_for_capability(
+        controller_id=controller_id,
+        ref=CapabilityRef(
+            deviceRef=DeviceRef(managerId="mqtt-main", deviceId="remote-0x0330"),
+            controlId="0,0",
+            capabilityId="raster.bitmap",
+        ),
+        command_type="set_frame",
+        params={
+            "commandType": "set_frame",
+            "image": base64.b64encode(image).decode("ascii"),
+            "encoding": "jpeg",
+        },
+    )
+
+
 def test_extract_action_values_supports_plain_payload():
     assert _extract_action_values("off") == ["off"]
 
@@ -121,8 +152,8 @@ def test_extract_action_values_supports_json_action_payload():
     ]
 
 
-def test_build_slots_infers_button_and_encoder_controls():
-    slots = build_slots(
+def test_build_controls_infers_button_and_encoder_controls():
+    controls = build_controls(
         [
             RemoteEventMapping(match="off", slot="0,0", gesture="key_up"),
             RemoteEventMapping(
@@ -134,25 +165,29 @@ def test_build_slots_infers_button_and_encoder_controls():
         ]
     )
 
-    assert [slot.id for slot in slots] == ["0,0", "3,0"]
-    assert slots[0].slot_type == "button"
-    assert slots[0].gestures == ("key_up",)
-    assert slots[1].slot_type == "encoder"
-    assert slots[1].gestures == ("encoder_rotate",)
+    assert [control.control_id for control in controls] == ["0,0", "3,0"]
+    assert controls[0].kind == "button"
+    assert {cap.capability_id for cap in controls[0].input_capabilities} == {
+        "button.momentary",
+        "button.press",
+    }
+    assert controls[1].kind == "encoder"
+    assert controls[1].input_capabilities[0].capability_id == "encoder.relative"
 
 
-def test_mapping_builds_hardware_input():
+def test_mapping_builds_control_input_events():
     mapping = RuntimeRemoteMapping(
         match="brightness_step_down",
         slot="3,0",
         gesture="encoder_rotate",
         direction="counterclockwise",
     )
-    hw_input = mapping.to_hardware_input()
+    events = mapping.to_control_input_events()
 
-    assert isinstance(hw_input, hw_messages.DialRotateMessage)
-    assert hw_input.dial_id == "3,0"
-    assert hw_input.direction == "counterclockwise"
+    assert len(events) == 1
+    assert events[0].control_id == "3,0"
+    assert events[0].capability_id == "encoder.relative"
+    assert events[0].value["direction"] == "counterclockwise"
 
 
 def test_deduper_suppresses_duplicate_actions_within_window():
@@ -342,7 +377,7 @@ async def test_reconcile_devices_publishes_aggregate_inventory(tmp_path: Path):
         assert entry is not None
         inventory = HardwareInventory.model_validate(entry.value)
         assert set(inventory.devices) == {"remote-0x0330"}
-        assert inventory.devices["remote-0x0330"].descriptor["id"] == "remote-0x0330"
+        assert inventory.devices["remote-0x0330"].descriptor.device_id == "remote-0x0330"
 
 
 @pytest.mark.asyncio
@@ -408,11 +443,7 @@ async def test_claimed_mqtt_input_is_sent_only_to_claiming_controller(tmp_path: 
 
         async with main.subscribe() as main_stream, other.subscribe() as other_stream:
             await component._handle_device_message(
-                hw_messages.hardware_input_message(
-                    manager_id="mqtt-main",
-                    device_id="remote-0x0330",
-                    body=hw_messages.KeyUpMessage(key_id="0,0"),
-                )
+                _input_message()
             )
             received = await main_stream.receive()
             with anyio.move_on_after(0.05) as scope:
@@ -426,12 +457,6 @@ async def test_claimed_mqtt_input_is_sent_only_to_claiming_controller(tmp_path: 
 async def test_broker_snapshot_claim_delete_resets_and_drops_input(tmp_path: Path):
     class FakeDevice:
         id = "remote-0x0330"
-        slots = [
-            hw_messages.HardwareSlot(
-                id="0,0",
-                coordinates=hw_messages.HardwareCoordinates(column=0, row=0),
-            )
-        ]
 
         def __init__(self) -> None:
             self.clear_slot = AsyncMock()
@@ -466,22 +491,15 @@ async def test_broker_snapshot_claim_delete_resets_and_drops_input(tmp_path: Pat
             )
             await deckr.state().delete(claim_key)
             await component._reconcile_routing_current_state(reason="test snapshot")
-            with anyio.fail_after(1):
-                while device.clear_slot.await_count < 1:
-                    await anyio.sleep(0.01)
 
             await component._handle_device_message(
-                hw_messages.hardware_input_message(
-                    manager_id="mqtt-main",
-                    device_id="remote-0x0330",
-                    body=hw_messages.KeyUpMessage(key_id="0,0"),
-                )
+                _input_message()
             )
             with anyio.move_on_after(0.05) as scope:
                 await main_stream.receive()
             tg.cancel_scope.cancel()
 
-    device.clear_slot.assert_awaited_once_with("0,0")
+    device.clear_slot.assert_not_awaited()
     assert scope.cancel_called
 
 
@@ -506,12 +524,6 @@ async def test_controller_presence_restore_makes_current_claim_routable(tmp_path
 async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
     class FakeDevice:
         id = "remote-0x0330"
-        slots = [
-            hw_messages.HardwareSlot(
-                id="0,0",
-                coordinates=hw_messages.HardwareCoordinates(column=0, row=0),
-            )
-        ]
 
         def __init__(self) -> None:
             self.clear_slot = AsyncMock()
@@ -544,25 +556,16 @@ async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
                 "mqtt-main",
             )
             await component._reconcile_routing_current_state(reason="test snapshot")
-            with anyio.fail_after(1):
-                while device.clear_slot.await_count < 1:
-                    await anyio.sleep(0.01)
             tg.cancel_scope.cancel()
 
     assert "remote-0x0330" not in component._claims
-    device.clear_slot.assert_awaited_once_with("0,0")
+    device.clear_slot.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_direct_commands_apply_only_from_claiming_controller(tmp_path: Path):
     class FakeDevice:
         id = "remote-0x0330"
-        slots = [
-            hw_messages.HardwareSlot(
-                id="0,0",
-                coordinates=hw_messages.HardwareCoordinates(column=0, row=0),
-            )
-        ]
 
         def __init__(self) -> None:
             self.set_image = AsyncMock()
@@ -597,33 +600,13 @@ async def test_direct_commands_apply_only_from_claiming_controller(tmp_path: Pat
                 "mqtt-main",
             )
             await component._route_command(
-                hw_messages.hardware_command_for_control(
-                    controller_id="other",
-                    ref=hw_messages.HardwareControlRef(
-                        manager_id="mqtt-main",
-                        device_id="remote-0x0330",
-                        control_id="0,0",
-                        control_kind="slot",
-                    ),
-                    message_type=hw_messages.SET_IMAGE,
-                    body=hw_messages.SetImageMessage(slot_id="0,0", image=b"wrong"),
-                )
+                _command_message("other", b"wrong")
             )
             await anyio.sleep(0.05)
             device.set_image.assert_not_awaited()
 
             await component._route_command(
-                hw_messages.hardware_command_for_control(
-                    controller_id="main",
-                    ref=hw_messages.HardwareControlRef(
-                        manager_id="mqtt-main",
-                        device_id="remote-0x0330",
-                        control_id="0,0",
-                        control_kind="slot",
-                    ),
-                    message_type=hw_messages.SET_IMAGE,
-                    body=hw_messages.SetImageMessage(slot_id="0,0", image=b"ok"),
-                )
+                _command_message("main", b"ok")
             )
             with anyio.fail_after(1):
                 while device.set_image.await_count < 1:
