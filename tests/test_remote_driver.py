@@ -93,7 +93,7 @@ def _write_remote_config(
     path: Path,
     *,
     device_id: str = "remote-0x0330",
-    slot: str = "0,0",
+    control_id: str = "0,0",
     topic: str = "zigbee2mqtt/remote/0x0330/action",
 ) -> None:
     path.write_text(
@@ -106,8 +106,8 @@ remote:
     topic: {topic}
   events:
     - match: off
-      slot: "{slot}"
-      gesture: key_up
+      control_id: "{control_id}"
+      event_type: press
 """
     )
 
@@ -118,9 +118,9 @@ def _input_message() -> hw_messages.ControlInputMessage:
         device_id="remote-0x0330",
         fingerprint="remote-0x0330",
         control_id="0,0",
-        capability_id="button.momentary",
-        event_type="up",
-        value={"eventType": "up"},
+        capability_id="button.press",
+        event_type="press",
+        value={"eventType": "press"},
     )
 
 
@@ -155,11 +155,11 @@ def test_extract_action_values_supports_json_action_payload():
 def test_build_controls_infers_button_and_encoder_controls():
     controls = build_controls(
         [
-            RemoteEventMapping(match="off", slot="0,0", gesture="key_up"),
+            RemoteEventMapping(match="off", control_id="0,0", event_type="press"),
             RemoteEventMapping(
                 match="brightness_step_up",
-                slot="3,0",
-                gesture="encoder_rotate",
+                control_id="3,0",
+                event_type="rotate",
                 direction="clockwise",
             ),
         ]
@@ -168,7 +168,6 @@ def test_build_controls_infers_button_and_encoder_controls():
     assert [control.control_id for control in controls] == ["0,0", "3,0"]
     assert controls[0].kind == "button"
     assert {cap.capability_id for cap in controls[0].input_capabilities} == {
-        "button.momentary",
         "button.press",
     }
     assert controls[1].kind == "encoder"
@@ -178,8 +177,8 @@ def test_build_controls_infers_button_and_encoder_controls():
 def test_mapping_builds_control_input_events():
     mapping = RuntimeRemoteMapping(
         match="brightness_step_down",
-        slot="3,0",
-        gesture="encoder_rotate",
+        control_id="3,0",
+        event_type="rotate",
         direction="counterclockwise",
     )
     events = mapping.to_control_input_events()
@@ -210,11 +209,11 @@ remote:
     dedupe_ms: 300
   events:
     - match: off
-      slot: "0,0"
-      gesture: key_up
+      control_id: "0,0"
+      event_type: press
     - match: brightness_step_up
-      slot: "3,0"
-      gesture: encoder_rotate
+      control_id: "3,0"
+      event_type: rotate
       direction: clockwise
 """
     )
@@ -251,8 +250,8 @@ remote:
     topic: zigbee2mqtt/remote/0x0330/action
   events:
     - match: off
-      slot: "0,0"
-      gesture: key_up
+      control_id: "0,0"
+      event_type: press
 """
     )
 
@@ -292,8 +291,8 @@ remote:
     topic: zigbee2mqtt/remote/0x0330/action
   events:
     - match: off
-      slot: "0,0"
-      gesture: key_up
+      control_id: "0,0"
+      event_type: press
 """
     )
 
@@ -348,8 +347,8 @@ remote:
     topic: zigbee2mqtt/remote/0x0330/action-2
   events:
     - match: off
-      slot: "1,0"
-      gesture: key_up
+      control_id: "1,0"
+      event_type: press
 """
         )
         await component._reconcile_devices()
@@ -459,7 +458,7 @@ async def test_broker_snapshot_claim_delete_resets_and_drops_input(tmp_path: Pat
         id = "remote-0x0330"
 
         def __init__(self) -> None:
-            self.clear_slot = AsyncMock()
+            self.clear_raster = AsyncMock()
 
     _write_remote_config(tmp_path / "remote.yml")
 
@@ -499,7 +498,7 @@ async def test_broker_snapshot_claim_delete_resets_and_drops_input(tmp_path: Pat
                 await main_stream.receive()
             tg.cancel_scope.cancel()
 
-    device.clear_slot.assert_not_awaited()
+    device.clear_raster.assert_not_awaited()
     assert scope.cancel_called
 
 
@@ -526,7 +525,7 @@ async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
         id = "remote-0x0330"
 
         def __init__(self) -> None:
-            self.clear_slot = AsyncMock()
+            self.clear_raster = AsyncMock()
 
     _write_remote_config(tmp_path / "remote.yml")
 
@@ -559,7 +558,7 @@ async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
             tg.cancel_scope.cancel()
 
     assert "remote-0x0330" not in component._claims
-    device.clear_slot.assert_not_awaited()
+    device.clear_raster.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -568,14 +567,8 @@ async def test_direct_commands_apply_only_from_claiming_controller(tmp_path: Pat
         id = "remote-0x0330"
 
         def __init__(self) -> None:
-            self.set_image = AsyncMock()
-            self.clear_slot = AsyncMock()
-
-        async def sleep_screen(self) -> None:
-            return
-
-        async def wake_screen(self) -> None:
-            return
+            self.set_raster_frame = AsyncMock()
+            self.clear_raster = AsyncMock()
 
     _write_remote_config(tmp_path / "remote.yml")
 
@@ -603,14 +596,14 @@ async def test_direct_commands_apply_only_from_claiming_controller(tmp_path: Pat
                 _command_message("other", b"wrong")
             )
             await anyio.sleep(0.05)
-            device.set_image.assert_not_awaited()
+            device.set_raster_frame.assert_not_awaited()
 
             await component._route_command(
                 _command_message("main", b"ok")
             )
             with anyio.fail_after(1):
-                while device.set_image.await_count < 1:
+                while device.set_raster_frame.await_count < 1:
                     await anyio.sleep(0.01)
             tg.cancel_scope.cancel()
 
-    device.set_image.assert_awaited_once_with("0,0", b"ok")
+    device.set_raster_frame.assert_awaited_once_with("0,0", b"ok")

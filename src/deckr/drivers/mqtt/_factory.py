@@ -81,12 +81,13 @@ _CONTROLLER_PRESENCE_PREFIX = ".".join(
     )
 )
 
-RemoteGesture = Literal[
-    "key_down",
-    "key_up",
-    "encoder_rotate",
-    "touch_tap",
-    "touch_swipe",
+RemoteInputEventType = Literal[
+    "down",
+    "up",
+    "press",
+    "rotate",
+    "tap",
+    "swipe",
 ]
 
 
@@ -114,8 +115,8 @@ class DriverConfig(BaseModel):
 
 class RemoteEventMapping(BaseModel):
     match: str
-    slot: str
-    gesture: RemoteGesture
+    control_id: str
+    event_type: RemoteInputEventType
     direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
 
     @field_validator("match", mode="before")
@@ -152,74 +153,77 @@ class MqttBrokerDefaults:
 @dataclass(frozen=True, slots=True)
 class RuntimeRemoteMapping:
     match: str
-    slot: str
-    gesture: RemoteGesture
+    control_id: str
+    event_type: RemoteInputEventType
     direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
 
     def to_control_input_events(self) -> tuple[ControlInputEvent, ...]:
-        if self.gesture == "key_down":
+        if self.event_type == "down":
             return (
                 ControlInputEvent(
-                    control_id=self.slot,
+                    control_id=self.control_id,
                     capability_id="button.momentary",
                     event_type="down",
                     value={"eventType": "down"},
                 ),
             )
-        if self.gesture == "key_up":
+        if self.event_type == "up":
             return (
                 ControlInputEvent(
-                    control_id=self.slot,
+                    control_id=self.control_id,
                     capability_id="button.momentary",
                     event_type="up",
                     value={"eventType": "up"},
                 ),
+            )
+        if self.event_type == "press":
+            return (
                 ControlInputEvent(
-                    control_id=self.slot,
+                    control_id=self.control_id,
                     capability_id="button.press",
                     event_type="press",
                     value={"eventType": "press"},
                 ),
             )
-        if self.gesture == "encoder_rotate":
+        if self.event_type == "rotate":
             direction = self.direction
             if direction not in {"clockwise", "counterclockwise"}:
                 raise ValueError(
-                    f"encoder_rotate mapping for {self.slot!r} requires direction"
+                    f"rotate mapping for {self.control_id!r} requires direction"
                 )
             delta = 1 if direction == "clockwise" else -1
             return (
                 ControlInputEvent(
-                    control_id=self.slot,
+                    control_id=self.control_id,
                     capability_id="encoder.relative",
                     event_type="rotate",
                     value={"delta": delta, "direction": direction},
                 ),
             )
-        if self.gesture == "touch_tap":
+        if self.event_type == "tap":
             return (
                 ControlInputEvent(
-                    control_id=self.slot,
+                    control_id=self.control_id,
                     capability_id="touch.gesture",
                     event_type="tap",
                     value={"eventType": "tap"},
                 ),
             )
-        if self.gesture == "touch_swipe":
+        if self.event_type == "swipe":
             direction = self.direction
             if direction not in {"left", "right"}:
                 raise ValueError(
-                    f"touch_swipe mapping for {self.slot!r} requires direction"
+                    f"swipe mapping for {self.control_id!r} requires direction"
                 )
             return (
                 ControlInputEvent(
-                    control_id=self.slot,
+                    control_id=self.control_id,
                     capability_id="touch.gesture",
                     event_type="swipe",
                     value={"eventType": "swipe", "direction": direction},
                 ),
             )
-        raise ValueError(f"Unsupported remote gesture: {self.gesture}")
+        raise ValueError(f"Unsupported remote event type: {self.event_type}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -251,17 +255,17 @@ DeviceCommand = DeckrMessage | ResetDeviceCommand
 InputPublisher = Callable[[DeckrMessage], Awaitable[None]]
 
 
-def _parse_coordinates(slot_id: str) -> tuple[int, int]:
-    parts = slot_id.split(",")
+def _parse_coordinates(control_id: str) -> tuple[int, int]:
+    parts = control_id.split(",")
     if len(parts) == 2 and all(part.strip("-").isdigit() for part in parts):
         return int(parts[0]), int(parts[1])
     return 0, 0
 
 
-def _slot_type_for_gestures(gestures: set[RemoteGesture]) -> str:
-    if "encoder_rotate" in gestures:
+def _control_kind_for_events(event_types: set[RemoteInputEventType]) -> str:
+    if "rotate" in event_types:
         return "encoder"
-    if any(gesture.startswith("touch_") for gesture in gestures):
+    if event_types & {"tap", "swipe"}:
         return "touch_strip"
     return "button"
 
@@ -329,7 +333,7 @@ def _momentary_button_capability() -> CapabilityDescriptor:
     )
 
 
-def _activation_button_capability(control_id: str) -> CapabilityDescriptor:
+def _activation_button_capability() -> CapabilityDescriptor:
     return CapabilityDescriptor(
         capabilityId="button.press",
         family=DECKR_INPUT_BUTTON,
@@ -341,13 +345,6 @@ def _activation_button_capability(control_id: str) -> CapabilityDescriptor:
             "deckr.value.input.button.activation.v1",
         ),
         eventTypes=("press",),
-        projection={
-            "owner": "hardware_manager",
-            "source": {
-                "controlId": control_id,
-                "capabilityId": "button.momentary",
-            },
-        },
     )
 
 
@@ -393,32 +390,33 @@ def _touch_capability() -> CapabilityDescriptor:
 
 
 def build_controls(mappings: list[RemoteEventMapping]) -> list[ControlDescriptor]:
-    by_slot: dict[str, set[RemoteGesture]] = defaultdict(set)
+    by_control: dict[str, set[RemoteInputEventType]] = defaultdict(set)
     for mapping in mappings:
-        by_slot[mapping.slot].add(mapping.gesture)
+        by_control[mapping.control_id].add(mapping.event_type)
     controls = []
-    for slot_id, gestures in sorted(
-        by_slot.items(),
+    for control_id, event_types in sorted(
+        by_control.items(),
         key=lambda item: (
             _parse_coordinates(item[0])[1],
             _parse_coordinates(item[0])[0],
             item[0],
         ),
     ):
-        column, row = _parse_coordinates(slot_id)
+        column, row = _parse_coordinates(control_id)
         capabilities: list[CapabilityDescriptor] = []
-        if "key_down" in gestures or "key_up" in gestures:
+        if "down" in event_types or "up" in event_types:
             capabilities.append(_momentary_button_capability())
-            capabilities.append(_activation_button_capability(slot_id))
-        if "encoder_rotate" in gestures:
+        if "press" in event_types:
+            capabilities.append(_activation_button_capability())
+        if "rotate" in event_types:
             capabilities.append(_encoder_capability())
-        if any(gesture.startswith("touch_") for gesture in gestures):
+        if event_types & {"tap", "swipe"}:
             capabilities.append(_touch_capability())
         controls.append(
             ControlDescriptor(
-                controlId=slot_id,
-                kind=_slot_type_for_gestures(gestures),
-                label=slot_id,
+                controlId=control_id,
+                kind=_control_kind_for_events(event_types),
+                label=control_id,
                 geometry=ControlGeometry(x=column, y=row, width=1, height=1, unit="grid"),
                 inputCapabilities=tuple(capabilities),
                 sources=(),
@@ -524,8 +522,8 @@ def _load_remote_device(
     mappings = tuple(
         RuntimeRemoteMapping(
             match=mapping.match,
-            slot=mapping.slot,
-            gesture=mapping.gesture,
+            control_id=mapping.control_id,
+            event_type=mapping.event_type,
             direction=mapping.direction,
         )
         for mapping in candidate.remote.events
@@ -639,9 +637,12 @@ async def _apply_device_commands(
         if message.command_type == "set_frame":
             encoded = message.params.get("image")
             if isinstance(encoded, str):
-                await device.set_image(message.control_id, base64.b64decode(encoded))
+                await device.set_raster_frame(
+                    message.control_id,
+                    base64.b64decode(encoded),
+                )
         elif message.command_type == "clear":
-            await device.clear_slot(message.control_id)
+            await device.clear_raster(message.control_id)
 
 
 async def _mqtt_loop(
@@ -1272,8 +1273,8 @@ def _hardware_device_from_runtime(
         [
             RemoteEventMapping(
                 match=mapping.match,
-                slot=mapping.slot,
-                gesture=mapping.gesture,
+                control_id=mapping.control_id,
+                event_type=mapping.event_type,
                 direction=mapping.direction,
             )
             for mapping in runtime.mappings

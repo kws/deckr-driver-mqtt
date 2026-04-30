@@ -38,16 +38,10 @@ class RemoteDevice:
     def hid(self) -> str:
         return self._hid
 
-    async def set_image(self, slot_id: str, image: bytes) -> None:
+    async def set_raster_frame(self, control_id: str, image: bytes) -> None:
         return
 
-    async def clear_slot(self, slot_id: str) -> None:
-        return
-
-    async def sleep_screen(self) -> None:
-        return
-
-    async def wake_screen(self) -> None:
+    async def clear_raster(self, control_id: str) -> None:
         return
 
     async def emit(self, event: ControlInputEvent) -> None:
