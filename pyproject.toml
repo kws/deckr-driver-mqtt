@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "deckr-driver-mqtt"
 version = "0.2.0.dev0"
-description = "Deckr MQTT-backed remote device driver"
+description = "Deckr MQTT-backed remote hardware manager"
 readme = "README.md"
 license = { text = "MIT" }
 authors = [

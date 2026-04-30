@@ -1,9 +1,9 @@
 # deckr-driver-mqtt
 
-MQTT-backed remote hardware driver for Deckr.
+MQTT-backed remote hardware manager for Deckr.
 
-The driver keeps the existing `deckr.drivers.mqtt` runtime surface and is intended to
-be loaded by the controller through the normal `deckr.drivers` entry point group.
+The manager keeps the existing `deckr.drivers.mqtt` runtime surface and is
+loaded through the normal `deckr.components` entry point group.
 
 ## Development
 
