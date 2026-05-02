@@ -11,10 +11,18 @@ from deckr.contracts.models import DeckrModel
 from deckr.lanes import (
     ReplyPredicate,
     message_is_deliverable,
+    message_sender_session_is_current,
     reply_is_accepted,
     validate_message_for_contract,
 )
-from deckr.state import StateChange, StateConflict, StateEntry, StateStore, state_value
+from deckr.state import (
+    DEFAULT_STATE_STORE_NAME,
+    StateChange,
+    StateConflict,
+    StateEntry,
+    StateStore,
+    state_value,
+)
 
 
 class MemoryLaneSubstrate:
@@ -23,12 +31,14 @@ class MemoryLaneSubstrate:
         *,
         lane_contracts: LaneContractRegistry,
         buffer_size: int = 100,
+        default_state_name: str = DEFAULT_STATE_STORE_NAME,
     ) -> None:
         self._lane_contracts = lane_contracts
+        self.default_state_name = default_state_name
         self._buffer_size = buffer_size
         self._lock = anyio.Lock()
         self._subscribers: dict[
-            tuple[str, EndpointAddress],
+            tuple[str, EndpointAddress, str],
             set[anyio.abc.ObjectSendStream[DeckrMessage]],
         ] = {}
         self._states: dict[str, MemoryStateStore] = {}
@@ -36,16 +46,26 @@ class MemoryLaneSubstrate:
     async def publish(self, message: DeckrMessage) -> None:
         contract = self._lane_contracts.contract_for(message.lane)
         validate_message_for_contract(message, contract)
+        if not await message_sender_session_is_current(
+            message,
+            state=self.state(self.default_state_name),
+        ):
+            return
         async with self._lock:
             subscribers = [
-                (endpoint, tuple(streams))
-                for (lane, endpoint), streams in self._subscribers.items()
+                (endpoint, endpoint_session_id, tuple(streams))
+                for (
+                    lane,
+                    endpoint,
+                    endpoint_session_id,
+                ), streams in self._subscribers.items()
                 if lane == message.lane
             ]
-        for endpoint, streams in subscribers:
+        for endpoint, endpoint_session_id, streams in subscribers:
             if not message_is_deliverable(
                 message,
                 endpoint=endpoint,
+                endpoint_session_id=endpoint_session_id,
                 contract=contract,
             ):
                 continue
@@ -68,7 +88,11 @@ class MemoryLaneSubstrate:
         timeout: float = 2.0,
         accept: ReplyPredicate | None = None,
     ) -> DeckrMessage:
-        async with self.subscribe(message.lane, message.sender) as stream:
+        async with self.subscribe(
+            message.lane,
+            message.sender,
+            endpoint_session_id=message.sender_session_id,
+        ) as stream:
             await self.publish(message)
             with anyio.fail_after(timeout):
                 while True:
@@ -81,11 +105,13 @@ class MemoryLaneSubstrate:
         self,
         lane: str,
         endpoint: EndpointAddress,
+        *,
+        endpoint_session_id: str,
     ) -> AsyncIterator[anyio.abc.ObjectReceiveStream[DeckrMessage]]:
         send, receive = anyio.create_memory_object_stream[DeckrMessage](
             max_buffer_size=self._buffer_size
         )
-        key = (lane, endpoint)
+        key = (lane, endpoint, endpoint_session_id)
         async with self._lock:
             self._subscribers.setdefault(key, set()).add(send)
         try:
@@ -151,10 +177,16 @@ class MemoryStateStore:
         *,
         ttl: float | None = None,
     ) -> StateEntry:
+        del ttl
+        normalized = state_value(value)
         async with self._lock:
             if key in self._entries:
                 raise StateConflict(f"State key {key!r} already exists")
-        return await self.put(key, value, ttl=ttl)
+            entry = self._next_entry(key, normalized)
+            self._entries[key] = entry
+            watchers = self._watchers_for(key)
+        await self._publish(watchers, StateChange("put", key, entry))
+        return entry
 
     async def update(
         self,

@@ -3,9 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import logging
-import uuid
 from collections import defaultdict
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -42,7 +42,7 @@ from deckr.hardware.descriptors import (
     DeviceDescriptor,
     DeviceRef,
 )
-from deckr.lanes import EndpointLane, Lane
+from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import (
     DeviceClaim,
     EndpointPresence,
@@ -55,7 +55,6 @@ from deckr.state import (
     hardware_inventory_key,
     parse_device_claim_key,
     parse_presence_endpoint_key,
-    presence_endpoint_key,
 )
 from decouple import config as decouple_config
 from pydantic import BaseModel, Field, field_validator
@@ -67,8 +66,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
 QOS = 2
-PRESENCE_HEARTBEAT_SECONDS = 5.0
-PRESENCE_TTL_SECONDS = 15
+INVENTORY_HEARTBEAT_SECONDS = 5.0
+INVENTORY_TTL_SECONDS = 15
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 _CONTROLLER_PRESENCE_PREFIX = ".".join(
@@ -595,11 +594,13 @@ async def _forward_device_events(
     device: RemoteDevice,
     publish_input: InputPublisher,
     manager_id: str,
+    sender_session_id: str,
 ) -> None:
     async for event in device.subscribe():
         await publish_input(
             hw_messages.control_input_message(
                 manager_id=manager_id,
+                sender_session_id=sender_session_id,
                 device_id=device.id,
                 fingerprint=device.hid,
                 control_id=event.control_id,
@@ -704,6 +705,7 @@ async def device_loop(
     publish_input: InputPublisher,
     command_stream: anyio.abc.ObjectReceiveStream[DeviceCommand],
     manager_id: str,
+    sender_session_id: str,
 ) -> None:
     device = RemoteDevice(
         device_id=runtime.id,
@@ -730,6 +732,7 @@ async def device_loop(
                 device,
                 publish_input,
                 manager_id,
+                sender_session_id,
             )
             tg.start_soon(
                 _run_until_complete,
@@ -760,9 +763,12 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         self._manager_id = manager_id
         self._config_dir = config_dir
         self._default_mqtt = default_mqtt or load_mqtt_broker_defaults()
-        self._session_id = str(uuid.uuid4())
+        self._session_id = ""
         self._cancel_scope: anyio.CancelScope | None = None
-        self._endpoint: EndpointLane | None = None
+        self._endpoint_cm: (
+            AbstractAsyncContextManager[RegisteredEndpointLane] | None
+        ) = None
+        self._endpoint: RegisteredEndpointLane | None = None
         self._task_group: anyio.abc.TaskGroup | None = None
         self._stop_event: anyio.Event | None = None
         self._running_devices: dict[str, RunningRemoteDevice] = {}
@@ -771,24 +777,33 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         self._controller_presence_sessions: dict[EndpointAddress, str] = {}
         self._unroutable_devices: set[str] = set()
         self._command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]] = {}
-        self._presence_revision: int | None = None
         self._inventory_revision: int | None = None
         self._routing_reconcile_lock = anyio.Lock()
 
     async def start(self, ctx: RunContext) -> None:
-        self._endpoint = self._hardware_lane.endpoint(
-            hardware_manager_address(self._manager_id)
-        )
-        self._cancel_scope = ctx.tg.cancel_scope
-        self._task_group = ctx.tg
-        self._stop_event = anyio.Event()
-        await self._reconcile_devices()
-        ctx.tg.start_soon(self._presence_loop)
-        ctx.tg.start_soon(self._command_subscription_loop)
-        ctx.tg.start_soon(self._claim_watch_loop)
-        ctx.tg.start_soon(self._controller_presence_loop)
-        ctx.tg.start_soon(self._routing_reconciliation_loop)
-        ctx.tg.start_soon(self._watch_loop)
+        try:
+            self._endpoint_cm = self._hardware_lane.register_endpoint(
+                hardware_manager_address(self._manager_id),
+                metadata={"runtime": "deckr-driver-mqtt-python"},
+            )
+            self._endpoint = await self._endpoint_cm.__aenter__()
+            self._session_id = self._endpoint.session_id
+            self._cancel_scope = ctx.tg.cancel_scope
+            self._task_group = ctx.tg
+            self._stop_event = anyio.Event()
+            await self._reconcile_devices()
+            await self._publish_inventory_safely()
+            ctx.tg.start_soon(self._inventory_refresh_loop)
+            ctx.tg.start_soon(self._command_subscription_loop)
+            ctx.tg.start_soon(self._claim_watch_loop)
+            ctx.tg.start_soon(self._controller_presence_loop)
+            ctx.tg.start_soon(self._routing_reconciliation_loop)
+            ctx.tg.start_soon(self._watch_loop)
+        except BaseException:
+            with anyio.CancelScope(shield=True):
+                await self._withdraw_inventory()
+                await self._close_endpoint()
+            raise
 
     async def stop(self) -> None:
         with anyio.CancelScope(shield=True):
@@ -799,8 +814,8 @@ class RemoteDeviceFactoryComponent(BaseComponent):
             self._devices.clear()
             self._claims.clear()
             self._unroutable_devices.clear()
-            await self._withdraw_presence()
             await self._withdraw_inventory()
+            await self._close_endpoint()
 
     async def _run_device(self, runtime: RemoteDeviceRuntime) -> None:
         stopped = anyio.Event()
@@ -816,12 +831,13 @@ class RemoteDeviceFactoryComponent(BaseComponent):
             self._command_streams[runtime.id] = command_send
             try:
                 async with command_send, command_receive:
-                    await device_loop(
-                        runtime,
-                        self._handle_device_message,
-                        command_receive,
-                        self._manager_id,
-                    )
+                        await device_loop(
+                            runtime,
+                            self._handle_device_message,
+                            command_receive,
+                            self._manager_id,
+                            self._session_id,
+                        )
             finally:
                 self._command_streams.pop(runtime.id, None)
                 stopped.set()
@@ -878,6 +894,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                     await self._endpoint.publish(
                         hw_messages.device_unavailable_message(
                             manager_id=self._manager_id,
+                            sender_session_id=self._endpoint.session_id,
                             device_id=device_id,
                             reason="removed",
                         )
@@ -887,6 +904,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                         await self._endpoint.publish(
                             hw_messages.device_available_message(
                                 manager_id=self._manager_id,
+                                sender_session_id=self._endpoint.session_id,
                                 descriptor=descriptor,
                             )
                         )
@@ -894,6 +912,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                         await self._endpoint.publish(
                             hw_messages.device_descriptor_changed_message(
                                 manager_id=self._manager_id,
+                                sender_session_id=self._endpoint.session_id,
                                 descriptor=descriptor,
                             )
                         )
@@ -920,54 +939,12 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         except Exception:
             logger.exception("Remote device config watch loop failed")
 
-    async def _presence_loop(self) -> None:
-        if self._endpoint is None:
-            return
-        key = presence_endpoint_key(
-            lane=self._endpoint.lane.name,
-            endpoint=self._endpoint.endpoint,
-        )
-        while True:
-            try:
-                entry = await self._state.put(
-                    key,
-                    EndpointPresence(
-                        endpoint=self._endpoint.endpoint,
-                        lane=self._endpoint.lane.name,
-                        sessionId=self._session_id,
-                        timestamp=datetime.now(UTC),
-                        ttlSeconds=PRESENCE_TTL_SECONDS,
-                        metadata={"runtime": "deckr-driver-mqtt-python"},
-                    ),
-                    ttl=PRESENCE_TTL_SECONDS,
-                )
-                self._presence_revision = entry.revision
-                await self._publish_inventory_safely()
-            except StateUnavailable:
-                logger.warning(
-                    "MQTT manager current state is unavailable; heartbeat will retry",
-                    exc_info=True,
-                )
-            await anyio.sleep(PRESENCE_HEARTBEAT_SECONDS)
-
-    async def _withdraw_presence(self) -> None:
-        if self._endpoint is None:
-            return
-        revision = self._presence_revision
-        if revision is None:
-            return
-        key = presence_endpoint_key(
-            lane=self._endpoint.lane.name,
-            endpoint=self._endpoint.endpoint,
-        )
-        with anyio.CancelScope(shield=True):
-            try:
-                await self._state.delete(key, revision=revision)
-                self._presence_revision = None
-            except StateConflict:
-                logger.debug("MQTT manager presence changed before withdrawal")
-            except StateUnavailable:
-                logger.warning("Failed to withdraw MQTT manager presence", exc_info=True)
+    async def _close_endpoint(self) -> None:
+        endpoint_cm = self._endpoint_cm
+        self._endpoint_cm = None
+        self._endpoint = None
+        if endpoint_cm is not None:
+            await endpoint_cm.__aexit__(None, None, None)
 
     async def _handle_device_message(self, message: DeckrMessage) -> None:
         if self._endpoint is None:
@@ -995,6 +972,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         await self._endpoint.publish(
             hw_messages.hardware_message(
                 sender=self._endpoint.endpoint,
+                sender_session_id=self._endpoint.session_id,
                 recipient=endpoint_target(recipient),
                 message_type=message.message_type,
                 body=event,
@@ -1013,7 +991,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 managerEndpoint=self._endpoint.endpoint,
                 sessionId=self._session_id,
                 timestamp=datetime.now(UTC),
-                ttlSeconds=PRESENCE_TTL_SECONDS,
+                ttlSeconds=INVENTORY_TTL_SECONDS,
                 devices={
                     device_id: HardwareInventoryDevice(
                         deviceRef=DeviceRef(
@@ -1026,7 +1004,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                     for device_id, device in sorted(self._devices.items())
                 },
             ),
-            ttl=PRESENCE_TTL_SECONDS,
+            ttl=INVENTORY_TTL_SECONDS,
         )
         self._inventory_revision = entry.revision
 
@@ -1038,6 +1016,11 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 "MQTT inventory current state is unavailable; heartbeat will retry",
                 exc_info=True,
             )
+
+    async def _inventory_refresh_loop(self) -> None:
+        while True:
+            await anyio.sleep(INVENTORY_HEARTBEAT_SECONDS)
+            await self._publish_inventory_safely()
 
     async def _withdraw_inventory(self) -> None:
         revision = self._inventory_revision

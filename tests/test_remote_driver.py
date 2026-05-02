@@ -1,4 +1,6 @@
 import base64
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -6,9 +8,14 @@ from unittest.mock import AsyncMock
 import anyio
 import pytest
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, LaneContractRegistry
-from deckr.contracts.messages import controller_address, hardware_manager_address
+from deckr.contracts.messages import (
+    EndpointAddress,
+    controller_address,
+    hardware_manager_address,
+)
 from deckr.hardware import messages as hw_messages
 from deckr.hardware.descriptors import CapabilityRef, DeviceRef
+from deckr.lanes import RegisteredEndpointLane
 from deckr.runtime import Deckr
 from deckr.state import (
     DeviceClaim,
@@ -32,6 +39,71 @@ from deckr.drivers.mqtt._factory import (
     load_remote_devices,
 )
 
+MANAGER_SESSION = "manager-session"
+CONTROLLER_SESSION = "controller-session"
+
+
+class EndpointHarness:
+    def __init__(
+        self,
+        deckr: Deckr,
+        endpoint: EndpointAddress,
+        *,
+        session_id: str,
+    ) -> None:
+        self._state = deckr.state()
+        self._registered = RegisteredEndpointLane(
+            lane=deckr.lane("hardware_messages"),
+            endpoint=endpoint,
+            session_id=session_id,
+            state=self._state,
+            metadata={"runtime": "test"},
+        )
+
+    @property
+    def lane(self):
+        return self._registered.lane
+
+    @property
+    def endpoint(self) -> EndpointAddress:
+        return self._registered.endpoint
+
+    @property
+    def session_id(self) -> str:
+        return self._registered.session_id
+
+    async def _ensure_presence(self) -> None:
+        await self._state.put(
+            presence_endpoint_key(lane=self.lane.name, endpoint=self.endpoint),
+            EndpointPresence(
+                endpoint=self.endpoint,
+                lane=self.lane.name,
+                sessionId=self.session_id,
+                timestamp=datetime.now(UTC),
+                ttlSeconds=15,
+            ),
+            ttl=15,
+        )
+
+    async def publish(self, message):
+        await self._ensure_presence()
+        return await self._registered.publish(message)
+
+    @asynccontextmanager
+    async def subscribe(self) -> AsyncIterator:
+        await self._ensure_presence()
+        async with self._registered.subscribe() as stream:
+            yield stream
+
+
+def _endpoint(
+    deckr: Deckr,
+    endpoint: EndpointAddress,
+    *,
+    session_id: str = CONTROLLER_SESSION,
+) -> EndpointHarness:
+    return EndpointHarness(deckr, endpoint, session_id=session_id)
+
 
 def _deckr() -> Deckr:
     lane_contracts = LaneContractRegistry(CORE_LANE_CONTRACTS.values())
@@ -54,9 +126,12 @@ def _factory(deckr: Deckr, config_dir: Path) -> RemoteDeviceFactoryComponent:
             password=None,
         ),
     )
-    manager._endpoint = deckr.lane("hardware_messages").endpoint(
-        hardware_manager_address("mqtt-main")
+    manager._endpoint = _endpoint(
+        deckr,
+        hardware_manager_address("mqtt-main"),
+        session_id=MANAGER_SESSION,
     )
+    manager._session_id = manager._endpoint.session_id
     return manager
 
 
@@ -115,6 +190,7 @@ remote:
 def _input_message() -> hw_messages.ControlInputMessage:
     return hw_messages.control_input_message(
         manager_id="mqtt-main",
+        sender_session_id=MANAGER_SESSION,
         device_id="remote-0x0330",
         fingerprint="remote-0x0330",
         control_id="0,0",
@@ -127,6 +203,7 @@ def _input_message() -> hw_messages.ControlInputMessage:
 def _command_message(controller_id: str, image: bytes) -> hw_messages.ControlCommandMessage:
     return hw_messages.control_command_for_capability(
         controller_id=controller_id,
+        sender_session_id=CONTROLLER_SESSION,
         ref=CapabilityRef(
             deviceRef=DeviceRef(managerId="mqtt-main", deviceId="remote-0x0330"),
             controlId="0,0",
@@ -298,8 +375,14 @@ remote:
 
     started_topics: list[str] = []
 
-    async def fake_device_loop(runtime, publish_input, command_stream, manager_id):
-        del publish_input, command_stream
+    async def fake_device_loop(
+        runtime,
+        publish_input,
+        command_stream,
+        manager_id,
+        sender_session_id,
+    ):
+        del publish_input, command_stream, sender_session_id
         assert manager_id == "mqtt-main"
         started_topics.append(runtime.mqtt_topic)
         await anyio.sleep_forever()
@@ -322,9 +405,12 @@ remote:
                 password=None,
             ),
         )
-        component._endpoint = deckr.lane("hardware_messages").endpoint(
-            hardware_manager_address("mqtt-main")
+        component._endpoint = _endpoint(
+            deckr,
+            hardware_manager_address("mqtt-main"),
+            session_id=MANAGER_SESSION,
         )
+        component._session_id = component._endpoint.session_id
         component._task_group = tg
         component._stop_event = anyio.Event()
         await component._reconcile_devices()
@@ -417,9 +503,12 @@ async def test_inventory_state_unavailable_keeps_configured_device(tmp_path: Pat
                 password=None,
             ),
         )
-        component._endpoint = deckr.lane("hardware_messages").endpoint(
-            hardware_manager_address("mqtt-main")
+        component._endpoint = _endpoint(
+            deckr,
+            hardware_manager_address("mqtt-main"),
+            session_id=MANAGER_SESSION,
         )
+        component._session_id = component._endpoint.session_id
         await component._reconcile_devices()
 
     assert "remote-0x0330" in component._devices
@@ -437,8 +526,8 @@ async def test_claimed_mqtt_input_is_sent_only_to_claiming_controller(tmp_path: 
         component._controller_presence_sessions[controller_address("main")] = (
             "controller-session"
         )
-        main = deckr.lane("hardware_messages").endpoint(controller_address("main"))
-        other = deckr.lane("hardware_messages").endpoint(controller_address("other"))
+        main = _endpoint(deckr, controller_address("main"))
+        other = _endpoint(deckr, controller_address("other"), session_id="other-session")
 
         async with main.subscribe() as main_stream, other.subscribe() as other_stream:
             await component._handle_device_message(
@@ -474,7 +563,7 @@ async def test_broker_snapshot_claim_delete_resets_and_drops_input(tmp_path: Pat
         claim_key = "claim.device.mqtt-main.remote-0x0330"
         await deckr.state().create(claim_key, _claim())
         await component._reconcile_routing_current_state(reason="test snapshot")
-        main = deckr.lane("hardware_messages").endpoint(controller_address("main"))
+        main = _endpoint(deckr, controller_address("main"))
 
         async with (
             command_send,
