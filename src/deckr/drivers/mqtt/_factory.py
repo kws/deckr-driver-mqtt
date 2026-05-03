@@ -785,6 +785,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
             self._endpoint_cm = self._hardware_lane.register_endpoint(
                 hardware_manager_address(self._manager_id),
                 metadata={"runtime": "deckr-driver-mqtt-python"},
+                task_group=ctx.tg,
             )
             self._endpoint = await self._endpoint_cm.__aenter__()
             self._session_id = self._endpoint.session_id
