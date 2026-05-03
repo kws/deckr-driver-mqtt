@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import json
 import logging
 from collections import defaultdict
@@ -30,12 +31,20 @@ from deckr.contracts.messages import (
     hardware_manager_address,
 )
 from deckr.hardware import messages as hw_messages
+from deckr.hardware.capabilities import (
+    RasterBitmapClearParams,
+    RasterBitmapSetFrameParams,
+    button_activation_value_schema,
+    button_momentary_value_schema,
+    encoder_relative_value_schema,
+    raster_bitmap_command_params,
+    touch_gesture_value_schema,
+)
 from deckr.hardware.descriptors import (
     DECKR_INPUT_BUTTON,
     DECKR_INPUT_ENCODER,
     DECKR_INPUT_TOUCH,
     CapabilityDescriptor,
-    CapabilitySchema,
     ControlDescriptor,
     ControlGeometry,
     DeviceConnection,
@@ -57,7 +66,7 @@ from deckr.state import (
     parse_presence_endpoint_key,
 )
 from decouple import config as decouple_config
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationError, field_validator
 from watchfiles import Change, awatch
 
 from ._device import ControlInputEvent, RemoteDevice
@@ -269,54 +278,6 @@ def _control_kind_for_events(event_types: set[RemoteInputEventType]) -> str:
     return "button"
 
 
-def _button_value_schema(events: tuple[str, ...], schema_id: str) -> CapabilitySchema:
-    return CapabilitySchema.model_validate(
-        {
-            "schemaId": schema_id,
-            "schema": {
-                "type": "object",
-                "required": ["eventType"],
-                "properties": {"eventType": {"enum": list(events)}},
-                "additionalProperties": False,
-            },
-        }
-    )
-
-
-def _encoder_value_schema() -> CapabilitySchema:
-    return CapabilitySchema.model_validate(
-        {
-            "schemaId": "deckr.value.input.encoder.relative.v1",
-            "schema": {
-                "type": "object",
-                "required": ["delta"],
-                "properties": {
-                    "delta": {"type": "integer"},
-                    "direction": {"enum": ["clockwise", "counterclockwise"]},
-                },
-                "additionalProperties": False,
-            },
-        }
-    )
-
-
-def _touch_value_schema() -> CapabilitySchema:
-    return CapabilitySchema.model_validate(
-        {
-            "schemaId": "deckr.value.input.touch.gesture.v1",
-            "schema": {
-                "type": "object",
-                "required": ["eventType"],
-                "properties": {
-                    "eventType": {"enum": ["tap", "swipe"]},
-                    "direction": {"enum": ["left", "right"]},
-                },
-                "additionalProperties": False,
-            },
-        }
-    )
-
-
 def _momentary_button_capability() -> CapabilityDescriptor:
     return CapabilityDescriptor(
         capabilityId="button.momentary",
@@ -324,10 +285,7 @@ def _momentary_button_capability() -> CapabilityDescriptor:
         type="momentary",
         direction="input",
         access=("emits",),
-        valueSchema=_button_value_schema(
-            ("down", "up"),
-            "deckr.value.input.button.momentary.v1",
-        ),
+        valueSchema=button_momentary_value_schema(),
         eventTypes=("down", "up"),
     )
 
@@ -339,10 +297,7 @@ def _activation_button_capability() -> CapabilityDescriptor:
         type="activation",
         direction="input",
         access=("emits",),
-        valueSchema=_button_value_schema(
-            ("press",),
-            "deckr.value.input.button.activation.v1",
-        ),
+        valueSchema=button_activation_value_schema(),
         eventTypes=("press",),
     )
 
@@ -355,7 +310,7 @@ def _encoder_capability() -> CapabilityDescriptor:
             "type": "relative",
             "direction": "input",
             "access": ["emits"],
-            "valueSchema": _encoder_value_schema().model_dump(
+            "valueSchema": encoder_relative_value_schema().model_dump(
                 by_alias=True,
                 exclude_none=True,
                 mode="json",
@@ -383,7 +338,7 @@ def _touch_capability() -> CapabilityDescriptor:
         type="gesture",
         direction="input",
         access=("emits",),
-        valueSchema=_touch_value_schema(),
+        valueSchema=touch_gesture_value_schema(),
         eventTypes=("tap", "swipe"),
     )
 
@@ -635,14 +590,20 @@ async def _apply_device_commands(
             continue
         if message.capability_id != "raster.bitmap" or message.control_id is None:
             continue
-        if message.command_type == "set_frame":
-            encoded = message.params.get("image")
-            if isinstance(encoded, str):
+        try:
+            params = raster_bitmap_command_params(message.command_type, message.params)
+        except (ValueError, ValidationError) as exc:
+            logger.warning("Ignoring invalid raster command params: %s", exc)
+            continue
+        if isinstance(params, RasterBitmapSetFrameParams):
+            try:
                 await device.set_raster_frame(
                     message.control_id,
-                    base64.b64decode(encoded),
+                    base64.b64decode(params.image, validate=True),
                 )
-        elif message.command_type == "clear":
+            except (ValueError, binascii.Error) as exc:
+                logger.warning("Ignoring invalid raster image payload: %s", exc)
+        elif isinstance(params, RasterBitmapClearParams):
             await device.clear_raster(message.control_id)
 
 

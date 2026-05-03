@@ -211,7 +211,6 @@ def _command_message(controller_id: str, image: bytes) -> hw_messages.ControlCom
         ),
         command_type="set_frame",
         params={
-            "commandType": "set_frame",
             "image": base64.b64encode(image).decode("ascii"),
             "encoding": "jpeg",
         },
