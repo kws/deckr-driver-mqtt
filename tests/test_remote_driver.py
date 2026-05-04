@@ -18,6 +18,8 @@ from deckr.hardware.descriptors import CapabilityRef, DeviceRef
 from deckr.lanes import RegisteredEndpointLane
 from deckr.runtime import Deckr
 from deckr.state import (
+    DEFAULT_DISCOVERY_STATE_STORE_NAME,
+    DEFAULT_LEASE_STATE_STORE_NAME,
     DeviceClaim,
     EndpointPresence,
     HardwareInventory,
@@ -80,9 +82,9 @@ class EndpointHarness:
                 lane=self.lane.name,
                 sessionId=self.session_id,
                 timestamp=datetime.now(UTC),
-                ttlSeconds=90,
+                ttlSeconds=30,
             ),
-            ttl=90,
+            ttl=30,
         )
 
     async def publish(self, message):
@@ -116,7 +118,8 @@ def _deckr() -> Deckr:
 def _factory(deckr: Deckr, config_dir: Path) -> RemoteDeviceFactoryComponent:
     manager = RemoteDeviceFactoryComponent(
         deckr.lane("hardware_messages"),
-        deckr.state(),
+        deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+        deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
         manager_id="mqtt-main",
         config_dir=config_dir,
         default_mqtt=MqttBrokerDefaults(
@@ -140,7 +143,7 @@ def _claim(controller_id: str = "main", session_id: str = "controller-session"):
         claimedByEndpoint=controller_address(controller_id),
         claimedBySessionId=session_id,
         timestamp=datetime.now(UTC),
-        ttlSeconds=90,
+        ttlSeconds=30,
     )
 
 
@@ -151,14 +154,14 @@ async def _put_controller_presence(
     session_id: str = "controller-session",
 ) -> None:
     endpoint = controller_address(controller_id)
-    await deckr.state().put(
+    await deckr.state(DEFAULT_LEASE_STATE_STORE_NAME).put(
         presence_endpoint_key(lane="hardware_messages", endpoint=endpoint),
         EndpointPresence(
             endpoint=endpoint,
             lane="hardware_messages",
             sessionId=session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=90,
+            ttlSeconds=30,
             metadata={},
         ),
     )
@@ -394,7 +397,8 @@ remote:
     async with _deckr() as deckr, anyio.create_task_group() as tg:
         component = RemoteDeviceFactoryComponent(
             deckr.lane("hardware_messages"),
-            deckr.state(),
+            deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+            deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
             manager_id="mqtt-main",
             config_dir=tmp_path,
             default_mqtt=MqttBrokerDefaults(
@@ -457,7 +461,9 @@ async def test_reconcile_devices_publishes_aggregate_inventory(tmp_path: Path):
         component = _factory(deckr, tmp_path)
         await component._reconcile_devices()
 
-        entry = await deckr.state().get(hardware_inventory_key("mqtt-main"))
+        entry = await deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME).get(
+            hardware_inventory_key("mqtt-main")
+        )
         assert entry is not None
         inventory = HardwareInventory.model_validate(entry.value)
         assert set(inventory.devices) == {"remote-0x0330"}
@@ -475,7 +481,9 @@ async def test_config_removal_rewrites_inventory(tmp_path: Path):
         config_path.unlink()
         await component._reconcile_devices()
 
-        entry = await deckr.state().get(hardware_inventory_key("mqtt-main"))
+        entry = await deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME).get(
+            hardware_inventory_key("mqtt-main")
+        )
         assert entry is not None
         inventory = HardwareInventory.model_validate(entry.value)
         assert inventory.devices == {}
@@ -492,6 +500,7 @@ async def test_inventory_state_unavailable_keeps_configured_device(tmp_path: Pat
     async with _deckr() as deckr:
         component = RemoteDeviceFactoryComponent(
             deckr.lane("hardware_messages"),
+            deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
             UnavailableState(),
             manager_id="mqtt-main",
             config_dir=tmp_path,
@@ -591,6 +600,40 @@ async def test_broker_snapshot_claim_delete_resets_and_drops_input(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_prefix_observation_omissions_keep_current_routing(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write_remote_config(tmp_path / "remote.yml")
+
+    async with _deckr() as deckr:
+        component = _factory(deckr, tmp_path)
+        await component._reconcile_devices()
+        await _put_controller_presence(deckr)
+        await deckr.state().create(
+            "claim.device.mqtt-main.remote-0x0330",
+            _claim(),
+        )
+        await component._reconcile_routing_current_state(reason="initial snapshot")
+        assert component._claim_recipient("remote-0x0330") == controller_address("main")
+
+        async def omitted_items(prefix: str = ""):
+            del prefix
+            return ()
+
+        monkeypatch.setattr(
+            deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+            "items",
+            omitted_items,
+        )
+
+        await component._reconcile_routing_current_state(reason="omitted snapshot")
+
+        assert component._claim_recipient("remote-0x0330") == controller_address("main")
+        assert "remote-0x0330" in component._claims
+
+
+@pytest.mark.asyncio
 async def test_controller_presence_restore_makes_current_claim_routable(tmp_path: Path):
     _write_remote_config(tmp_path / "remote.yml")
 
@@ -630,7 +673,7 @@ async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
             {
                 "claimedByEndpoint": "controller:main",
                 "timestamp": datetime.now(UTC).isoformat(),
-                "ttlSeconds": 90,
+                "ttlSeconds": 30,
             },
         )
         await _put_controller_presence(deckr)
