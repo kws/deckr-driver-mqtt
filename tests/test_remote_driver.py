@@ -80,9 +80,9 @@ class EndpointHarness:
                 lane=self.lane.name,
                 sessionId=self.session_id,
                 timestamp=datetime.now(UTC),
-                ttlSeconds=15,
+                ttlSeconds=90,
             ),
-            ttl=15,
+            ttl=90,
         )
 
     async def publish(self, message):
@@ -140,7 +140,7 @@ def _claim(controller_id: str = "main", session_id: str = "controller-session"):
         claimedByEndpoint=controller_address(controller_id),
         claimedBySessionId=session_id,
         timestamp=datetime.now(UTC),
-        ttlSeconds=15,
+        ttlSeconds=90,
     )
 
 
@@ -158,7 +158,7 @@ async def _put_controller_presence(
             lane="hardware_messages",
             sessionId=session_id,
             timestamp=datetime.now(UTC),
-            ttlSeconds=15,
+            ttlSeconds=90,
             metadata={},
         ),
     )
@@ -630,7 +630,7 @@ async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
             {
                 "claimedByEndpoint": "controller:main",
                 "timestamp": datetime.now(UTC).isoformat(),
-                "ttlSeconds": 15,
+                "ttlSeconds": 90,
             },
         )
         await _put_controller_presence(deckr)

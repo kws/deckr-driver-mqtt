@@ -53,6 +53,7 @@ from deckr.hardware.descriptors import (
 )
 from deckr.lanes import Lane, RegisteredEndpointLane
 from deckr.state import (
+    DEFAULT_STATE_LEASE_TTL_SECONDS,
     DeviceClaim,
     EndpointPresence,
     HardwareInventory,
@@ -76,7 +77,7 @@ logger = logging.getLogger(__name__)
 CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
 QOS = 2
 INVENTORY_HEARTBEAT_SECONDS = 5.0
-INVENTORY_TTL_SECONDS = 15
+INVENTORY_TTL_SECONDS = DEFAULT_STATE_LEASE_TTL_SECONDS
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 _CONTROLLER_PRESENCE_PREFIX = ".".join(
