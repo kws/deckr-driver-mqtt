@@ -21,7 +21,7 @@ dependencies = [
 ]
 
 [project.entry-points."deckr.components"]
-"deckr.drivers.mqtt" = "deckr.drivers.mqtt:component"
+"com.k-si.deckr.hardware.mqtt" = "deckr.drivers.mqtt:component"
 
 [project.urls]
 Documentation = "https://github.com/kws/deckr-driver-mqtt#readme"

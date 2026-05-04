@@ -118,7 +118,6 @@ class DriverBrokerConfig(BaseModel):
 
 
 class DriverConfig(BaseModel):
-    manager_id: str
     config_path: Path | None = None
     broker: DriverBrokerConfig = Field(default_factory=DriverBrokerConfig)
 
@@ -1303,6 +1302,8 @@ def driver_factory(
     hardware_lane: Lane,
     lease_state: StateStore,
     discovery_state: StateStore,
+    *,
+    manager_id: str,
     config: Mapping[str, Any] | None = None,
 ):
     driver_config = load_driver_config(config)
@@ -1310,7 +1311,7 @@ def driver_factory(
         hardware_lane,
         lease_state,
         discovery_state,
-        manager_id=driver_config.manager_id,
+        manager_id=manager_id,
         config_dir=driver_config.config_path or CONFIG_DIR,
         default_mqtt=load_mqtt_broker_defaults(config),
     )
@@ -1321,16 +1322,18 @@ def component_factory(context: ComponentContext):
         context.require_lane("hardware_messages"),
         context.state(DEFAULT_LEASE_STATE_STORE_NAME),
         context.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
-        config=context.raw_config,
+        manager_id=context.require_endpoint_id("hardware_manager"),
+        config=context.config,
     )
 
 
 component = ComponentDefinition(
     manifest=ComponentManifest(
-        component_id="deckr.drivers.mqtt",
-        config_prefix="deckr.drivers.mqtt",
+        component_id="com.k-si.deckr.hardware.mqtt",
         consumes=("hardware_messages",),
         publishes=("hardware_messages",),
+        endpoint_slots=("hardware_manager",),
+        role="hardware_manager",
     ),
     factory=component_factory,
 )
