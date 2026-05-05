@@ -1329,7 +1329,7 @@ def component_factory(context: ComponentContext):
 
 component = ComponentDefinition(
     manifest=ComponentManifest(
-        component_id="com.k-si.deckr.hardware.mqtt",
+        component_id="dev.deckr.hardware.mqtt",
         consumes=("hardware_messages",),
         publishes=("hardware_messages",),
         endpoint_slots=("hardware_manager",),
