@@ -336,7 +336,12 @@ def test_infer_paulmann_controls_as_core_buttons():
         "button.press",
     )
     assert controls["store"].capability_ids == ("button.press",)
+    assert controls["store_1"].capability_ids == ("button.press",)
+    assert controls["store_2"].capability_ids == ("button.press",)
     assert "brightness_stop" not in controls
+    assert controls["recall"].capability_ids == ("button.press",)
+    assert controls["recall_1"].capability_ids == ("button.press",)
+    assert controls["recall_2"].capability_ids == ("button.press",)
 
 
 def test_infer_hue_dimmer_press_release_and_hold_as_momentary_buttons():
@@ -377,6 +382,8 @@ def test_runtime_maps_json_actions_to_core_button_events():
     stop = runtime.events_for_payload('{"action":"brightness_stop"}')
     orphan_stop = runtime.events_for_payload('{"action":"brightness_stop"}')
     step = runtime.events_for_payload('{"action":"color_temperature_step_down"}')
+    scene_1 = runtime.events_for_payload('{"action":"recall_1"}')
+    scene_2 = runtime.events_for_payload('{"action":"recall_2"}')
 
     assert move[0].control_id == "brightness_up"
     assert move[0].capability_id == "button.momentary"
@@ -388,6 +395,12 @@ def test_runtime_maps_json_actions_to_core_button_events():
     assert step[0].control_id == "color_temperature_down"
     assert step[0].capability_id == "button.press"
     assert step[0].event_type == "press"
+    assert scene_1[0].control_id == "recall_1"
+    assert scene_1[0].capability_id == "button.press"
+    assert scene_1[0].event_type == "press"
+    assert scene_2[0].control_id == "recall_2"
+    assert scene_2[0].capability_id == "button.press"
+    assert scene_2[0].event_type == "press"
 
 
 def test_runtime_keeps_active_stop_state_per_device_axis():

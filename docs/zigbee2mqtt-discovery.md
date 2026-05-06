@@ -138,12 +138,19 @@ Actions without lifecycle information map to activation buttons:
 | `store` | `store` | `button.press` | `press` |
 | `recall` | `recall` | `button.press` | `press` |
 | `store_1` | `store_1` | `button.press` | `press` |
+| `store_2` | `store_2` | `button.press` | `press` |
 | `recall_1` | `recall_1` | `button.press` | `press` |
+| `recall_2` | `recall_2` | `button.press` | `press` |
 
 If a device toggles one physical button between `on` and `off`, the default
 mapping should still expose logical `on` and `off` controls. A convention
 override may group both actions into one `power` control when the physical
 layout is known.
+
+Some scene remotes advertise only bare `store` or `recall` values in
+Zigbee2MQTT metadata while the live MQTT event stream emits slotted values such
+as `recall_1` and `recall_2`. When the base value is advertised, the driver also
+exposes the common `_1` and `_2` scene slot variants as `button.press` controls.
 
 ### Gesture Slot Actions
 
@@ -300,7 +307,11 @@ Default inferred controls:
 - `color_temperature_up`: `button.press` and `button.momentary`
 - `color_temperature_down`: `button.press` and `button.momentary`
 - `store`: `button.press`
+- `store_1`: `button.press`
+- `store_2`: `button.press`
 - `recall`: `button.press`
+- `recall_1`: `button.press`
+- `recall_2`: `button.press`
 
 Optional physical-layout override:
 

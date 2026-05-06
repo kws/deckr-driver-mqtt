@@ -27,6 +27,8 @@ BUTTON_MOMENTARY_CAPABILITY_ID = "button.momentary"
 SIMPLE_PRESS_ACTIONS = frozenset({"on", "off", "toggle", "store", "recall"})
 _TOKEN_RE = re.compile(r"[^a-z0-9_]+")
 _STORE_RECALL_RE = re.compile(r"^(store|recall)_\d+$")
+_SCENE_SLOT_BASE_ACTIONS = ("store", "recall")
+_SCENE_SLOT_RANGE = range(1, 3)
 _DIRECTIONAL_AXIS_ACTION_RE = re.compile(
     r"^(?P<axis>brightness|color_temperature)_(?P<kind>step|move)_(?P<direction>up|down)$"
 )
@@ -351,6 +353,7 @@ def extract_action_values(payload: bytes | str, *, include_empty: bool = False) 
 
 
 def infer_actions(actions: Sequence[str]) -> tuple[InferredAction, ...]:
+    actions = _expanded_action_values(actions)
     known = set(actions)
     inferred: list[InferredAction] = []
     for action in actions:
@@ -358,6 +361,16 @@ def infer_actions(actions: Sequence[str]) -> tuple[InferredAction, ...]:
         if mapping is not None:
             inferred.append(mapping)
     return tuple(inferred)
+
+
+def _expanded_action_values(actions: Sequence[str]) -> tuple[str, ...]:
+    values = list(actions)
+    known = set(values)
+    for base in _SCENE_SLOT_BASE_ACTIONS:
+        if base not in known:
+            continue
+        values.extend(f"{base}_{slot}" for slot in _SCENE_SLOT_RANGE)
+    return unique(values)
 
 
 def infer_controls(actions: Sequence[str]) -> tuple[InferredControl, ...]:
