@@ -1,9 +1,7 @@
-import base64
+import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
-from pathlib import Path
-from unittest.mock import AsyncMock
 
 import anyio
 import pytest
@@ -14,7 +12,6 @@ from deckr.contracts.messages import (
     hardware_manager_address,
 )
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.descriptors import CapabilityRef, DeviceRef
 from deckr.lanes import RegisteredEndpointLane
 from deckr.runtime import Deckr
 from deckr.state import (
@@ -24,6 +21,7 @@ from deckr.state import (
     EndpointPresence,
     HardwareInventory,
     StateUnavailable,
+    encode_key_token,
     hardware_inventory_key,
     presence_endpoint_key,
 )
@@ -31,19 +29,73 @@ from memory_lane_substrate import MemoryLaneSubstrate
 
 from deckr.drivers.mqtt._factory import (
     Deduper,
-    MqttBrokerDefaults,
-    RemoteDeviceFactoryComponent,
-    RemoteEventMapping,
-    RuntimeRemoteMapping,
-    _apply_device_commands,
-    _extract_action_values,
-    build_controls,
+    DriverBrokerConfig,
+    Zigbee2MqttHardwareManager,
+    _runtime_from_zigbee2mqtt_device,
     driver_factory,
-    load_remote_devices,
+)
+from deckr.drivers.mqtt._zigbee2mqtt import (
+    build_controls,
+    extract_action_values,
+    infer_controls,
+    parse_bridge_devices,
 )
 
 MANAGER_SESSION = "manager-session"
 CONTROLLER_SESSION = "controller-session"
+PAULMANN_ID = "z2m.0xffffaa6712730330"
+PAULMANN_FINGERPRINT = "zigbee2mqtt:0xffffaa6712730330"
+PAULMANN_TOPIC = "zigbee2mqtt/remote/0x0330"
+
+PAULMANN_ACTIONS = [
+    "on",
+    "off",
+    "brightness_move_up",
+    "brightness_move_down",
+    "brightness_stop",
+    "brightness_step_up",
+    "brightness_step_down",
+    "color_temperature_move_up",
+    "color_temperature_move_down",
+    "color_temperature_move_stop",
+    "color_temperature_step_up",
+    "color_temperature_step_down",
+    "store",
+    "recall",
+]
+
+HUE_ACTIONS = [
+    "on_press",
+    "on_press_release",
+    "on_hold",
+    "on_hold_release",
+    "up_press",
+    "up_press_release",
+    "up_hold",
+    "up_hold_release",
+    "down_press",
+    "down_press_release",
+    "down_hold",
+    "down_hold_release",
+    "off_press",
+    "off_press_release",
+    "off_hold",
+    "off_hold_release",
+]
+
+STYRBAR_ACTIONS = [
+    "on",
+    "off",
+    "brightness_move_up",
+    "brightness_move_down",
+    "brightness_stop",
+    "arrow_left_click",
+    "arrow_left_hold",
+    "arrow_left_release",
+    "arrow_right_click",
+    "arrow_right_hold",
+    "arrow_right_release",
+]
 
 
 class EndpointHarness:
@@ -116,15 +168,15 @@ def _deckr() -> Deckr:
     )
 
 
-def _factory(deckr: Deckr, config_dir: Path) -> RemoteDeviceFactoryComponent:
-    manager = RemoteDeviceFactoryComponent(
+def _factory(deckr: Deckr) -> Zigbee2MqttHardwareManager:
+    manager = Zigbee2MqttHardwareManager(
         deckr.lane("hardware_messages"),
         deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
         deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
         manager_id="mqtt-main",
-        devices_dir=config_dir,
-        templates_dir=config_dir / "templates",
-        default_mqtt=MqttBrokerDefaults(
+        base_topic="zigbee2mqtt",
+        dedupe_ms=250,
+        broker=DriverBrokerConfig(
             hostname="mqtt-default.local",
             port=1883,
             username=None,
@@ -150,6 +202,13 @@ def _claim(controller_id: str = "main", session_id: str = "controller-session"):
     )
 
 
+def _claim_key(device_id: str = PAULMANN_ID) -> str:
+    return (
+        f"claim.device.{encode_key_token('mqtt-main')}."
+        f"{encode_key_token(device_id)}"
+    )
+
+
 async def _put_controller_presence(
     deckr: Deckr,
     *,
@@ -170,129 +229,198 @@ async def _put_controller_presence(
     )
 
 
-def _write_remote_config(
-    path: Path,
+def _bridge_payload(*devices: dict) -> str:
+    return json.dumps(list(devices))
+
+
+def _z2m_device(
     *,
-    device_id: str = "remote-0x0330",
-    control_id: str = "0,0",
-    topic: str = "zigbee2mqtt/remote/0x0330/action",
-    dedupe_ms: int | None = None,
-    template_id: str = "zigbee-remote",
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        f"""
-id: {device_id}
-name: Zigbee remote
-template: {template_id}
-remote:
-  mqtt:
-    topic: {topic}
-{f"    dedupe_ms: {dedupe_ms}" if dedupe_ms is not None else ""}
-"""
-    )
-    _write_remote_template(
-        path.parent / "templates" / f"{template_id}.yml",
-        template_id=template_id,
-        control_id=control_id,
-    )
-
-
-def _write_remote_template(
-    path: Path,
-    *,
-    template_id: str = "zigbee-remote",
-    control_id: str = "0,0",
-) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        f"""
-id: {template_id}
-name: Zigbee remote template
-events:
-  - match: off
-    control_id: "{control_id}"
-    event_type: press
-"""
-    )
-
-
-def _input_message() -> hw_messages.ControlInputMessage:
-    return hw_messages.control_input_message(
-        manager_id="mqtt-main",
-        sender_session_id=MANAGER_SESSION,
-        device_id="remote-0x0330",
-        fingerprint="remote-0x0330",
-        control_id="0,0",
-        capability_id="button.press",
-        event_type="press",
-        value={"eventType": "press"},
-    )
-
-
-def _command_message(controller_id: str, image: bytes) -> hw_messages.ControlCommandMessage:
-    return hw_messages.control_command_for_capability(
-        controller_id=controller_id,
-        sender_session_id=CONTROLLER_SESSION,
-        ref=CapabilityRef(
-            deviceRef=DeviceRef(managerId="mqtt-main", deviceId="remote-0x0330"),
-            controlId="0,0",
-            capabilityId="raster.bitmap",
-        ),
-        command_type="set_frame",
-        params={
-            "image": base64.b64encode(image).decode("ascii"),
-            "encoding": "jpeg",
+    friendly_name: str = "remote/0x0330",
+    ieee_address: str = "0xffffaa6712730330",
+    vendor: str = "Paulmann",
+    model: str = "501.41",
+    description: str = "Remote control Smart Home Zigbee 3.0 White",
+    actions: list[str] | None = None,
+    supported: bool = True,
+    disabled: bool = False,
+) -> dict:
+    return {
+        "ieee_address": ieee_address,
+        "friendly_name": friendly_name,
+        "type": "EndDevice",
+        "supported": supported,
+        "disabled": disabled,
+        "power_source": "Battery",
+        "model_id": model.replace(".", ""),
+        "interview_state": "SUCCESSFUL",
+        "definition": {
+            "vendor": vendor,
+            "model": model,
+            "description": description,
+            "exposes": [
+                {"type": "numeric", "property": "battery"},
+                {
+                    "type": "enum",
+                    "property": "action",
+                    "values": actions or PAULMANN_ACTIONS,
+                },
+                {"type": "numeric", "property": "linkquality"},
+            ],
         },
-    )
-
-
-def test_extract_action_values_supports_plain_payload():
-    assert _extract_action_values("off") == ["off"]
-
-
-def test_extract_action_values_supports_json_action_payload():
-    assert _extract_action_values(b'{"action":"brightness_step_up","battery":86}') == [
-        '{"action":"brightness_step_up","battery":86}',
-        "brightness_step_up",
-    ]
-
-
-def test_build_controls_infers_button_and_encoder_controls():
-    controls = build_controls(
-        [
-            RemoteEventMapping(match="off", control_id="0,0", event_type="press"),
-            RemoteEventMapping(
-                match="brightness_step_up",
-                control_id="3,0",
-                event_type="rotate",
-                direction="clockwise",
-            ),
-        ]
-    )
-
-    assert [control.control_id for control in controls] == ["0,0", "3,0"]
-    assert controls[0].kind == "button"
-    assert {cap.capability_id for cap in controls[0].input_capabilities} == {
-        "button.press",
     }
-    assert controls[1].kind == "encoder"
-    assert controls[1].input_capabilities[0].capability_id == "encoder.relative"
 
 
-def test_mapping_builds_control_input_events():
-    mapping = RuntimeRemoteMapping(
-        match="brightness_step_down",
-        control_id="3,0",
-        event_type="rotate",
-        direction="counterclockwise",
+def _paulmann_device():
+    return parse_bridge_devices(_bridge_payload(_z2m_device()))[0]
+
+
+def _hue_device():
+    return parse_bridge_devices(
+        _bridge_payload(
+            _z2m_device(
+                friendly_name="switch/huedimmer/0x8e62",
+                ieee_address="0x0017880108758e62",
+                vendor="Philips",
+                model="324131092621",
+                description="Hue dimmer switch",
+                actions=HUE_ACTIONS,
+            )
+        )
+    )[0]
+
+
+def _styrbar_device():
+    return parse_bridge_devices(
+        _bridge_payload(
+            _z2m_device(
+                friendly_name="switch/styrbar/0x94e9",
+                ieee_address="0x94b216fffe6794e9",
+                vendor="IKEA",
+                model="E2001/E2002",
+                description="STYRBAR remote control",
+                actions=STYRBAR_ACTIONS,
+            )
+        )
+    )[0]
+
+
+def test_extract_action_values_supports_plain_and_json_payloads():
+    assert extract_action_values("off") == ("off",)
+    assert extract_action_values(b'{"action":"brightness_step_up","battery":86}') == (
+        "brightness_step_up",
     )
-    events = mapping.to_control_input_events()
+    assert extract_action_values('"off"') == ("off",)
+    assert extract_action_values('{"action":""}') == ()
+    assert extract_action_values('{"action":""}', include_empty=True) == ("",)
+    assert extract_action_values('{"battery":86}') == ()
+    assert extract_action_values('{"action":86}') == ()
+    assert extract_action_values('["off"]') == ()
+    assert extract_action_values("86") == ()
 
-    assert len(events) == 1
-    assert events[0].control_id == "3,0"
-    assert events[0].capability_id == "encoder.relative"
-    assert events[0].value["direction"] == "counterclockwise"
+
+def test_infer_paulmann_controls_as_core_buttons():
+    controls = {control.control_id: control for control in infer_controls(PAULMANN_ACTIONS)}
+
+    assert controls["on"].capability_ids == ("button.press",)
+    assert controls["off"].capability_ids == ("button.press",)
+    assert controls["brightness_up"].capability_ids == (
+        "button.momentary",
+        "button.press",
+    )
+    assert controls["brightness_down"].capability_ids == (
+        "button.momentary",
+        "button.press",
+    )
+    assert controls["color_temperature_up"].capability_ids == (
+        "button.momentary",
+        "button.press",
+    )
+    assert controls["store"].capability_ids == ("button.press",)
+    assert "brightness_stop" not in controls
+
+
+def test_infer_hue_dimmer_press_release_and_hold_as_momentary_buttons():
+    controls = {control.control_id: control for control in infer_controls(HUE_ACTIONS)}
+
+    assert set(controls) == {"on", "up", "down", "off"}
+    assert controls["on"].capability_ids == ("button.momentary",)
+    assert {action.event_type for action in controls["on"].actions} == {"down", "up"}
+
+
+def test_infer_styrbar_mixed_simple_move_and_click_hold_release_controls():
+    controls = {control.control_id: control for control in infer_controls(STYRBAR_ACTIONS)}
+
+    assert controls["on"].capability_ids == ("button.press",)
+    assert controls["brightness_up"].capability_ids == ("button.momentary",)
+    assert controls["arrow_left"].capability_ids == (
+        "button.press",
+        "button.momentary",
+    )
+
+
+def test_build_controls_never_emits_fake_encoder_capabilities():
+    controls = build_controls(PAULMANN_ACTIONS)
+
+    assert {control.kind for control in controls} == {"button"}
+    assert {
+        capability.capability_id
+        for control in controls
+        for capability in control.input_capabilities
+    } == {"button.press", "button.momentary"}
+
+
+def test_runtime_maps_json_actions_to_core_button_events():
+    runtime = _runtime_from_zigbee2mqtt_device(_paulmann_device(), dedupe_ms=0)
+
+    assert runtime is not None
+    move = runtime.events_for_payload('{"action":"brightness_move_up","battery":86}')
+    stop = runtime.events_for_payload('{"action":"brightness_stop"}')
+    orphan_stop = runtime.events_for_payload('{"action":"brightness_stop"}')
+    step = runtime.events_for_payload('{"action":"color_temperature_step_down"}')
+
+    assert move[0].control_id == "brightness_up"
+    assert move[0].capability_id == "button.momentary"
+    assert move[0].event_type == "down"
+    assert move[0].value == {"eventType": "down"}
+    assert stop[0].control_id == "brightness_up"
+    assert stop[0].event_type == "up"
+    assert orphan_stop == ()
+    assert step[0].control_id == "color_temperature_down"
+    assert step[0].capability_id == "button.press"
+    assert step[0].event_type == "press"
+
+
+def test_runtime_keeps_active_stop_state_per_device_axis():
+    paulmann = _runtime_from_zigbee2mqtt_device(_paulmann_device(), dedupe_ms=0)
+    styrbar = _runtime_from_zigbee2mqtt_device(_styrbar_device(), dedupe_ms=0)
+
+    assert paulmann is not None
+    assert styrbar is not None
+    paulmann.events_for_payload('{"action":"brightness_move_down"}')
+
+    assert styrbar.events_for_payload('{"action":"brightness_stop"}') == ()
+    assert paulmann.events_for_payload('{"action":"brightness_stop"}')[0].control_id == (
+        "brightness_down"
+    )
+
+
+def test_runtime_maps_hue_and_styrbar_gestures():
+    hue = _runtime_from_zigbee2mqtt_device(_hue_device(), dedupe_ms=0)
+    styrbar = _runtime_from_zigbee2mqtt_device(_styrbar_device(), dedupe_ms=0)
+
+    assert hue is not None
+    assert styrbar is not None
+    assert hue.events_for_payload('{"action":"up_press"}')[0].event_type == "down"
+    assert hue.events_for_payload('{"action":"up_press_release"}')[0].event_type == "up"
+    assert styrbar.events_for_payload('{"action":"arrow_left_click"}')[0].capability_id == (
+        "button.press"
+    )
+    assert styrbar.events_for_payload('{"action":"arrow_left_hold"}')[0].event_type == (
+        "down"
+    )
+    assert styrbar.events_for_payload('{"action":"arrow_left_release"}')[0].event_type == (
+        "up"
+    )
 
 
 def test_deduper_suppresses_duplicate_actions_within_window():
@@ -302,126 +430,30 @@ def test_deduper_suppresses_duplicate_actions_within_window():
     assert deduper.should_emit("off") is False
 
 
-def test_load_remote_devices_reads_yaml_config(
-    tmp_path: Path,
-):
-    _write_remote_config(tmp_path / "remote.yml", dedupe_ms=300)
+def test_runtime_respects_action_dedupe_window():
+    runtime = _runtime_from_zigbee2mqtt_device(_paulmann_device(), dedupe_ms=500)
 
-    devices = load_remote_devices(
-        tmp_path,
-        templates_dir=tmp_path / "templates",
-        default_mqtt=MqttBrokerDefaults(
-            hostname="mqtt-default.local",
-            port=1883,
-            username=None,
-            password=None,
-        ),
+    assert runtime is not None
+    assert runtime.events_for_payload('{"action":"on"}')
+    assert runtime.events_for_payload('{"action":"on"}') == ()
+
+
+def test_orphan_stop_does_not_poison_next_real_stop():
+    runtime = _runtime_from_zigbee2mqtt_device(_paulmann_device(), dedupe_ms=500)
+
+    assert runtime is not None
+    assert runtime.events_for_payload('{"action":"brightness_stop"}') == ()
+    assert runtime.events_for_payload('{"action":"brightness_move_up"}')[0].event_type == (
+        "down"
     )
+    stop = runtime.events_for_payload('{"action":"brightness_stop"}')
 
-    assert len(devices) == 1
-    assert devices[0].id == "remote-0x0330"
-    assert devices[0].mqtt_hostname == "mqtt-default.local"
-    assert devices[0].mqtt_port == 1883
-    assert devices[0].mqtt_topic == "zigbee2mqtt/remote/0x0330/action"
-    assert devices[0].dedupe_ms == 300
-
-
-def test_load_remote_devices_rejects_per_device_broker_override(tmp_path: Path):
-    _write_remote_template(tmp_path / "templates" / "zigbee-remote.yml")
-    (tmp_path / "remote.yml").write_text(
-        """
-id: remote-0x0330
-name: Zigbee remote
-template: zigbee-remote
-remote:
-  mqtt:
-    hostname: mqtt-z2m.local
-    port: 1884
-    username: z2m
-    password: secret
-    topic: zigbee2mqtt/remote/0x0330/action
-"""
-    )
-
-    devices = load_remote_devices(
-        tmp_path,
-        templates_dir=tmp_path / "templates",
-        default_mqtt=MqttBrokerDefaults(
-            hostname="mqtt-default.local",
-            port=1883,
-            username=None,
-            password=None,
-        ),
-    )
-
-    assert devices == []
-
-
-def test_load_remote_devices_rejects_controller_profile_fields(tmp_path: Path):
-    _write_remote_template(tmp_path / "templates" / "zigbee-remote.yml")
-    (tmp_path / "remote.yml").write_text(
-        """
-id: remote-0x0330
-name: Zigbee remote
-template: zigbee-remote
-profiles:
-  - name: default
-    pages: []
-remote:
-  mqtt:
-    topic: zigbee2mqtt/remote/0x0330/action
-"""
-    )
-
-    devices = load_remote_devices(
-        tmp_path,
-        templates_dir=tmp_path / "templates",
-        default_mqtt=MqttBrokerDefaults(
-            hostname="mqtt-default.local",
-            port=1883,
-            username=None,
-            password=None,
-        ),
-    )
-
-    assert devices == []
-
-
-def test_load_remote_devices_rejects_missing_template(tmp_path: Path):
-    (tmp_path / "remote.yml").write_text(
-        """
-id: remote-0x0330
-name: Zigbee remote
-template: missing-template
-remote:
-  mqtt:
-    topic: zigbee2mqtt/remote/0x0330/action
-"""
-    )
-
-    devices = load_remote_devices(
-        tmp_path,
-        templates_dir=tmp_path / "templates",
-        default_mqtt=MqttBrokerDefaults(
-            hostname="mqtt-default.local",
-            port=1883,
-            username=None,
-            password=None,
-        ),
-    )
-
-    assert devices == []
+    assert stop[0].control_id == "brightness_up"
+    assert stop[0].event_type == "up"
 
 
 @pytest.mark.asyncio
-async def test_driver_factory_reads_manager_labels_and_broker_config(tmp_path: Path):
-    config_base_dir = tmp_path / "runtime" / "config"
-    config_base_dir.mkdir(parents=True)
-    mqtt_devices_dir = tmp_path / "runtime" / "hardware" / "mqtt" / "openhabian" / "devices"
-    mqtt_templates_dir = tmp_path / "runtime" / "hardware" / "mqtt" / "templates"
-    mqtt_devices_dir.mkdir(parents=True)
-    mqtt_templates_dir.mkdir(parents=True)
-
+async def test_driver_factory_reads_discovery_config_and_labels():
     async with _deckr() as deckr:
         component = driver_factory(
             deckr.lane("hardware_messages"),
@@ -429,114 +461,63 @@ async def test_driver_factory_reads_manager_labels_and_broker_config(tmp_path: P
             deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
             manager_id="mqtt-main",
             config={
-                "devices_path": "../hardware/mqtt/openhabian/devices",
-                "templates_path": "../hardware/mqtt/templates",
+                "base_topic": "zigbee2mqtt/",
+                "dedupe_ms": 300,
                 "broker": {"hostname": "openhabian", "port": 1884},
                 "labels": {"mqtt-host": "openhabian"},
             },
-            config_base_dir=config_base_dir,
         )
 
-        assert component._default_mqtt.hostname == "openhabian"
-        assert component._default_mqtt.port == 1884
+        assert component._base_topic == "zigbee2mqtt"
+        assert component._dedupe_ms == 300
+        assert component._broker.hostname == "openhabian"
+        assert component._broker.port == 1884
         assert component._labels == {"mqtt-host": "openhabian"}
-        assert component._devices_dir == mqtt_devices_dir
-        assert component._templates_dir == mqtt_templates_dir
 
 
 @pytest.mark.asyncio
-async def test_driver_factory_rejects_old_config_path_key(tmp_path: Path):
+async def test_driver_factory_rejects_old_config_file_keys(tmp_path):
     async with _deckr() as deckr:
-        with pytest.raises(ValueError):
-            driver_factory(
-                deckr.lane("hardware_messages"),
-                deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
-                deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
-                manager_id="mqtt-main",
-                config={"config_path": str(tmp_path)},
-            )
+        for config in (
+            {"config_path": str(tmp_path)},
+            {"devices_path": str(tmp_path)},
+            {"templates_path": str(tmp_path)},
+        ):
+            with pytest.raises(ValueError):
+                driver_factory(
+                    deckr.lane("hardware_messages"),
+                    deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+                    deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
+                    manager_id="mqtt-main",
+                    config=config,
+                )
 
 
 @pytest.mark.asyncio
-async def test_remote_driver_restarts_device_on_config_change(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    config_path = tmp_path / "remote.yml"
-    _write_remote_config(config_path)
-
-    started_topics: list[str] = []
-
-    async def fake_device_loop(
-        runtime,
-        publish_input,
-        command_stream,
-        manager_id,
-        sender_session_id,
-    ):
-        del publish_input, command_stream, sender_session_id
-        assert manager_id == "mqtt-main"
-        started_topics.append(runtime.mqtt_topic)
-        await anyio.sleep_forever()
-
-    monkeypatch.setattr(
-        "deckr.drivers.mqtt._factory.device_loop",
-        fake_device_loop,
+async def test_reconcile_discovered_devices_publishes_aggregate_inventory():
+    bridge = parse_bridge_devices(
+        _bridge_payload(
+            _z2m_device(),
+            _z2m_device(
+                friendly_name="disabled/remote",
+                ieee_address="0x1111",
+                disabled=True,
+            ),
+            _z2m_device(
+                friendly_name="unsupported/remote",
+                ieee_address="0x2222",
+                supported=False,
+            ),
+            {
+                "friendly_name": "sensor/no-action",
+                "definition": {"exposes": [{"property": "battery"}]},
+            },
+        )
     )
 
-    async with _deckr() as deckr, anyio.create_task_group() as tg:
-        component = RemoteDeviceFactoryComponent(
-            deckr.lane("hardware_messages"),
-            deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
-            deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
-            manager_id="mqtt-main",
-            devices_dir=tmp_path,
-            templates_dir=tmp_path / "templates",
-            default_mqtt=MqttBrokerDefaults(
-                hostname="mqtt-default.local",
-                port=1883,
-                username=None,
-                password=None,
-            ),
-        )
-        component._endpoint = _endpoint(
-            deckr,
-            hardware_manager_address("mqtt-main"),
-            session_id=MANAGER_SESSION,
-        )
-        component._session_id = component._endpoint.session_id
-        component._task_group = tg
-        component._stop_event = anyio.Event()
-        await component._reconcile_devices()
-
-        with anyio.fail_after(2):
-            while started_topics != ["zigbee2mqtt/remote/0x0330/action"]:
-                await anyio.sleep(0.05)
-
-        _write_remote_config(
-            config_path,
-            topic="zigbee2mqtt/remote/0x0330/action-2",
-            control_id="1,0",
-        )
-        await component._reconcile_devices()
-
-        with anyio.fail_after(2):
-            while started_topics != [
-                "zigbee2mqtt/remote/0x0330/action",
-                "zigbee2mqtt/remote/0x0330/action-2",
-            ]:
-                await anyio.sleep(0.05)
-
-        await component.stop()
-        tg.cancel_scope.cancel()
-
-
-@pytest.mark.asyncio
-async def test_reconcile_devices_publishes_aggregate_inventory(tmp_path: Path):
-    _write_remote_config(tmp_path / "remote.yml")
-
     async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
+        component = _factory(deckr)
+        await component._reconcile_discovered_devices(bridge)
 
         entry = await deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME).get(
             hardware_inventory_key("mqtt-main")
@@ -544,46 +525,26 @@ async def test_reconcile_devices_publishes_aggregate_inventory(tmp_path: Path):
         assert entry is not None
         inventory = HardwareInventory.model_validate(entry.value)
         assert inventory.labels == {"mqtt-host": "mqtt-default.local"}
-        assert set(inventory.devices) == {"remote-0x0330"}
-        assert inventory.devices["remote-0x0330"].descriptor.device_id == "remote-0x0330"
+        assert set(inventory.devices) == {PAULMANN_ID}
+        device = inventory.devices[PAULMANN_ID]
+        assert device.device_ref.fingerprint == PAULMANN_FINGERPRINT
+        assert device.descriptor.device_id == PAULMANN_ID
+        assert device.descriptor.fingerprint == PAULMANN_FINGERPRINT
 
 
 @pytest.mark.asyncio
-async def test_config_removal_rewrites_inventory(tmp_path: Path):
-    config_path = tmp_path / "remote.yml"
-    _write_remote_config(config_path)
-
-    async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
-        config_path.unlink()
-        await component._reconcile_devices()
-
-        entry = await deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME).get(
-            hardware_inventory_key("mqtt-main")
-        )
-        assert entry is not None
-        inventory = HardwareInventory.model_validate(entry.value)
-        assert inventory.devices == {}
-
-
-@pytest.mark.asyncio
-async def test_inventory_state_unavailable_keeps_configured_device(tmp_path: Path):
+async def test_inventory_state_unavailable_keeps_discovered_device():
     class UnavailableState:
-        async def put(self, *args, **kwargs):
+        async def put(self, *args):
             raise StateUnavailable("temporary substrate outage")
 
-    _write_remote_config(tmp_path / "remote.yml")
-
     async with _deckr() as deckr:
-        component = RemoteDeviceFactoryComponent(
+        component = Zigbee2MqttHardwareManager(
             deckr.lane("hardware_messages"),
             deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
             UnavailableState(),
             manager_id="mqtt-main",
-            devices_dir=tmp_path,
-            templates_dir=tmp_path / "templates",
-            default_mqtt=MqttBrokerDefaults(
+            broker=DriverBrokerConfig(
                 hostname="mqtt-default.local",
                 port=1883,
                 username=None,
@@ -596,20 +557,18 @@ async def test_inventory_state_unavailable_keeps_configured_device(tmp_path: Pat
             session_id=MANAGER_SESSION,
         )
         component._session_id = component._endpoint.session_id
-        await component._reconcile_devices()
+        await component._reconcile_discovered_devices((_paulmann_device(),))
 
-    assert "remote-0x0330" in component._devices
+    assert PAULMANN_ID in component._devices
     assert component._inventory_revision is None
 
 
 @pytest.mark.asyncio
-async def test_claimed_mqtt_input_is_sent_only_to_claiming_controller(tmp_path: Path):
-    _write_remote_config(tmp_path / "remote.yml")
-
+async def test_claimed_mqtt_input_is_sent_only_to_claiming_controller():
     async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
-        component._claims["remote-0x0330"] = _claim()
+        component = _factory(deckr)
+        await component._reconcile_discovered_devices((_paulmann_device(),))
+        component._claims[PAULMANN_ID] = _claim()
         component._controller_presence_sessions[controller_address("main")] = (
             "controller-session"
         )
@@ -617,84 +576,56 @@ async def test_claimed_mqtt_input_is_sent_only_to_claiming_controller(tmp_path: 
         other = _endpoint(deckr, controller_address("other"), session_id="other-session")
 
         async with main.subscribe() as main_stream, other.subscribe() as other_stream:
-            await component._handle_device_message(
-                _input_message()
+            await component._handle_mqtt_device_payload(
+                topic=PAULMANN_TOPIC,
+                payload='{"action":"on"}',
             )
             received = await main_stream.receive()
             with anyio.move_on_after(0.05) as scope:
                 await other_stream.receive()
 
+    body = hw_messages.hardware_body_from_message(received)
     assert received.recipient.endpoint == controller_address("main")
+    assert isinstance(body, hw_messages.ControlInputMessage)
+    assert body.control_id == "on"
+    assert body.capability_id == "button.press"
+    assert body.event_type == "press"
     assert scope.cancel_called
 
 
 @pytest.mark.asyncio
-async def test_broker_snapshot_claim_delete_resets_and_drops_input(tmp_path: Path):
-    class FakeDevice:
-        id = "remote-0x0330"
-
-        def __init__(self) -> None:
-            self.clear_raster = AsyncMock()
-
-    _write_remote_config(tmp_path / "remote.yml")
-
+async def test_broker_snapshot_claim_delete_drops_input():
     async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
-        device = FakeDevice()
-        command_send, command_receive = anyio.create_memory_object_stream(
-            max_buffer_size=100
-        )
-        component._command_streams["remote-0x0330"] = command_send
+        component = _factory(deckr)
+        await component._reconcile_discovered_devices((_paulmann_device(),))
         await _put_controller_presence(deckr)
-        claim_key = "claim.device.mqtt-main.remote-0x0330"
+        claim_key = _claim_key()
         await deckr.state().create(claim_key, _claim())
         await component._reconcile_routing_current_state(reason="test snapshot")
         main = _endpoint(deckr, controller_address("main"))
 
-        async with (
-            command_send,
-            command_receive,
-            main.subscribe() as main_stream,
-            anyio.create_task_group() as tg,
-        ):
-            tg.start_soon(
-                _apply_device_commands,
-                device,
-                command_receive,
-                "mqtt-main",
-            )
+        async with main.subscribe() as main_stream:
             await deckr.state().delete(claim_key)
             await component._reconcile_routing_current_state(reason="test snapshot")
-
-            await component._handle_device_message(
-                _input_message()
+            await component._handle_mqtt_device_payload(
+                topic=PAULMANN_TOPIC,
+                payload='{"action":"on"}',
             )
             with anyio.move_on_after(0.05) as scope:
                 await main_stream.receive()
-            tg.cancel_scope.cancel()
 
-    device.clear_raster.assert_not_awaited()
     assert scope.cancel_called
 
 
 @pytest.mark.asyncio
-async def test_prefix_observation_omissions_keep_current_routing(
-    tmp_path: Path,
-    monkeypatch,
-):
-    _write_remote_config(tmp_path / "remote.yml")
-
+async def test_prefix_observation_omissions_keep_current_routing(monkeypatch):
     async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
+        component = _factory(deckr)
+        await component._reconcile_discovered_devices((_paulmann_device(),))
         await _put_controller_presence(deckr)
-        await deckr.state().create(
-            "claim.device.mqtt-main.remote-0x0330",
-            _claim(),
-        )
+        await deckr.state().create(_claim_key(), _claim())
         await component._reconcile_routing_current_state(reason="initial snapshot")
-        assert component._claim_recipient("remote-0x0330") == controller_address("main")
+        assert component._claim_recipient(PAULMANN_ID) == controller_address("main")
 
         async def omitted_items(prefix: str = ""):
             del prefix
@@ -708,47 +639,31 @@ async def test_prefix_observation_omissions_keep_current_routing(
 
         await component._reconcile_routing_current_state(reason="omitted snapshot")
 
-        assert component._claim_recipient("remote-0x0330") == controller_address("main")
-        assert "remote-0x0330" in component._claims
+        assert component._claim_recipient(PAULMANN_ID) == controller_address("main")
+        assert PAULMANN_ID in component._claims
 
 
 @pytest.mark.asyncio
-async def test_controller_presence_restore_makes_current_claim_routable(tmp_path: Path):
-    _write_remote_config(tmp_path / "remote.yml")
-
+async def test_controller_presence_restore_makes_current_claim_routable():
     async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
-        claim_key = "claim.device.mqtt-main.remote-0x0330"
-        await deckr.state().create(claim_key, _claim())
+        component = _factory(deckr)
+        await component._reconcile_discovered_devices((_paulmann_device(),))
+        await deckr.state().create(_claim_key(), _claim())
         await component._reconcile_routing_current_state(reason="test snapshot")
-        assert component._claim_recipient("remote-0x0330") is None
+        assert component._claim_recipient(PAULMANN_ID) is None
 
         await _put_controller_presence(deckr)
         await component._reconcile_routing_current_state(reason="test snapshot")
-        assert component._claim_recipient("remote-0x0330") == controller_address("main")
+        assert component._claim_recipient(PAULMANN_ID) == controller_address("main")
 
 
 @pytest.mark.asyncio
-async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
-    class FakeDevice:
-        id = "remote-0x0330"
-
-        def __init__(self) -> None:
-            self.clear_raster = AsyncMock()
-
-    _write_remote_config(tmp_path / "remote.yml")
-
+async def test_invalid_claim_payload_is_not_routable():
     async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
-        device = FakeDevice()
-        command_send, command_receive = anyio.create_memory_object_stream(
-            max_buffer_size=100
-        )
-        component._command_streams["remote-0x0330"] = command_send
+        component = _factory(deckr)
+        await component._reconcile_discovered_devices((_paulmann_device(),))
         await deckr.state().put(
-            "claim.device.mqtt-main.remote-0x0330",
+            _claim_key(),
             {
                 "claimedByEndpoint": "controller:main",
                 "timestamp": datetime.now(UTC).isoformat(),
@@ -756,64 +671,6 @@ async def test_invalid_claim_payload_is_not_routable(tmp_path: Path):
             },
         )
         await _put_controller_presence(deckr)
+        await component._reconcile_routing_current_state(reason="test snapshot")
 
-        async with command_send, command_receive, anyio.create_task_group() as tg:
-            tg.start_soon(
-                _apply_device_commands,
-                device,
-                command_receive,
-                "mqtt-main",
-            )
-            await component._reconcile_routing_current_state(reason="test snapshot")
-            tg.cancel_scope.cancel()
-
-    assert "remote-0x0330" not in component._claims
-    device.clear_raster.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_direct_commands_apply_only_from_claiming_controller(tmp_path: Path):
-    class FakeDevice:
-        id = "remote-0x0330"
-
-        def __init__(self) -> None:
-            self.set_raster_frame = AsyncMock()
-            self.clear_raster = AsyncMock()
-
-    _write_remote_config(tmp_path / "remote.yml")
-
-    async with _deckr() as deckr:
-        component = _factory(deckr, tmp_path)
-        await component._reconcile_devices()
-        component._claims["remote-0x0330"] = _claim()
-        component._controller_presence_sessions[controller_address("main")] = (
-            "controller-session"
-        )
-        device = FakeDevice()
-        command_send, command_receive = anyio.create_memory_object_stream(
-            max_buffer_size=100
-        )
-        component._command_streams["remote-0x0330"] = command_send
-
-        async with command_send, command_receive, anyio.create_task_group() as tg:
-            tg.start_soon(
-                _apply_device_commands,
-                device,
-                command_receive,
-                "mqtt-main",
-            )
-            await component._route_command(
-                _command_message("other", b"wrong")
-            )
-            await anyio.sleep(0.05)
-            device.set_raster_frame.assert_not_awaited()
-
-            await component._route_command(
-                _command_message("main", b"ok")
-            )
-            with anyio.fail_after(1):
-                while device.set_raster_frame.await_count < 1:
-                    await anyio.sleep(0.01)
-            tg.cancel_scope.cancel()
-
-    device.set_raster_frame.assert_awaited_once_with("0,0", b"ok")
+    assert PAULMANN_ID not in component._claims

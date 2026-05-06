@@ -17,8 +17,8 @@ instance_id = "mqtt-openhabian"
 hardware_manager = "mqtt-openhabian"
 
 [deckr.components.instances.mqtt_openhabian.config]
-devices_path = "../hardware/mqtt/openhabian/devices"
-templates_path = "../hardware/mqtt/templates"
+base_topic = "zigbee2mqtt"
+dedupe_ms = 250
 
 [deckr.components.instances.mqtt_openhabian.config.broker]
 hostname = "openhabian"
@@ -28,31 +28,27 @@ port = 1883
 mqtt-host = "openhabian"
 ```
 
-Remote device YAML under `devices_path` describes the physical or virtual remote
-instance and MQTT topic. It references a reusable template from
-`templates_path`, which owns the control layout and MQTT action-to-Deckr event
-mapping. Per-device broker overrides are not supported.
+The manager discovers Zigbee2MQTT action devices from the retained
+`<base_topic>/bridge/devices` payload, subscribes to modern device state topics
+such as `zigbee2mqtt/remote/0x0330`, and infers Deckr core button controls from
+the Zigbee2MQTT action enum. Remote device YAML, reusable templates,
+`devices_path`, and `templates_path` are no longer supported.
 
-```yaml
-# devices_path/remote-bedroom.yml
-id: remote-0x0330
-name: Bedroom remote
-template: zigbee2mqtt-5-button-remote
-remote:
-  mqtt:
-    topic: zigbee2mqtt/remote/0x0330/action
-    dedupe_ms: 250
+## Zigbee2MQTT action inspection
+
+The `deckr-mqtt-actions` helper can inspect Zigbee2MQTT metadata and live
+remote action payloads:
+
+```bash
+deckr-mqtt-actions list-devices --hostname openhabian
+deckr-mqtt-actions describe-device --hostname openhabian --friendly-name remote/0x0330
+deckr-mqtt-actions infer-controls --hostname openhabian --friendly-name remote/0x0330
+deckr-mqtt-actions inspect --hostname openhabian --friendly-name remote/0x0330 --unique
 ```
 
-```yaml
-# templates_path/zigbee2mqtt-5-button-remote.yml
-id: zigbee2mqtt-5-button-remote
-name: Zigbee2MQTT 5-button remote
-events:
-  - match: off
-    control_id: volume-power
-    event_type: press
-```
+See [Zigbee2MQTT Discovery And Button Mapping](docs/zigbee2mqtt-discovery.md)
+for the discovery-driven mapping from Zigbee2MQTT actions to Deckr core button
+capabilities.
 
 ## Development
 

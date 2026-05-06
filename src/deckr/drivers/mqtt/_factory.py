@@ -1,21 +1,16 @@
 from __future__ import annotations
 
-import base64
-import binascii
-import json
 import logging
-from collections import defaultdict
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from time import monotonic
-from typing import Any, Literal
+from typing import Any
 
 import aiomqtt
 import anyio
-import yaml
 from deckr.components import (
     BaseComponent,
     ComponentContext,
@@ -31,22 +26,7 @@ from deckr.contracts.messages import (
     hardware_manager_address,
 )
 from deckr.hardware import messages as hw_messages
-from deckr.hardware.capabilities import (
-    RasterBitmapClearParams,
-    RasterBitmapSetFrameParams,
-    button_activation_value_schema,
-    button_momentary_value_schema,
-    encoder_relative_value_schema,
-    raster_bitmap_command_params,
-    touch_gesture_value_schema,
-)
 from deckr.hardware.descriptors import (
-    DECKR_INPUT_BUTTON,
-    DECKR_INPUT_ENCODER,
-    DECKR_INPUT_TOUCH,
-    CapabilityDescriptor,
-    ControlDescriptor,
-    ControlGeometry,
     DeviceConnection,
     DeviceDescriptor,
     DeviceRef,
@@ -69,18 +49,23 @@ from deckr.state import (
     parse_presence_endpoint_key,
     presence_endpoint_key,
 )
-from decouple import config as decouple_config
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
-from watchfiles import Change, awatch
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ._device import ControlInputEvent, RemoteDevice
+from ._zigbee2mqtt import (
+    DEFAULT_BASE_TOPIC,
+    DEFAULT_DEDUPE_MS,
+    QOS,
+    InferredAction,
+    Zigbee2MqttDevice,
+    build_controls,
+    extract_action_values,
+    infer_actions,
+    parse_bridge_devices,
+    topic_text,
+)
 
 logger = logging.getLogger(__name__)
 
-CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
-DEFAULT_DEVICES_DIR = CONFIG_DIR / "devices"
-DEFAULT_TEMPLATES_DIR = CONFIG_DIR / "templates"
-QOS = 2
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
 _CONTROLLER_PRESENCE_PREFIX = ".".join(
@@ -93,378 +78,44 @@ _CONTROLLER_PRESENCE_PREFIX = ".".join(
     )
 )
 
-RemoteInputEventType = Literal[
-    "down",
-    "up",
-    "press",
-    "rotate",
-    "tap",
-    "swipe",
-]
 
-
-class _RemoteConfigModel(BaseModel):
+class _DriverConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
-class RemoteMqttConfig(_RemoteConfigModel):
-    topic: str
-    dedupe_ms: int = 250
-
-
-class DriverBrokerConfig(_RemoteConfigModel):
+class DriverBrokerConfig(_DriverConfigModel):
     hostname: str = ""
     port: int = 1883
     username: str | None = None
     password: str | None = None
 
 
-class DriverConfig(_RemoteConfigModel):
-    devices_path: Path | None = None
-    templates_path: Path | None = None
+class DriverConfig(_DriverConfigModel):
+    base_topic: str = DEFAULT_BASE_TOPIC
+    dedupe_ms: int = DEFAULT_DEDUPE_MS
     broker: DriverBrokerConfig = Field(default_factory=DriverBrokerConfig)
     labels: dict[str, str] = Field(default_factory=dict)
 
-
-class RemoteEventMapping(_RemoteConfigModel):
-    match: str
-    control_id: str
-    event_type: RemoteInputEventType
-    direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
-
-    @field_validator("match", mode="before")
+    @field_validator("base_topic")
     @classmethod
-    def _normalize_match(cls, value: Any) -> str:
-        # YAML treats unquoted "on"/"off" as booleans, which is surprising for
-        # common MQTT action values. Normalize those back to the expected strings.
-        if value is True:
-            return "on"
-        if value is False:
-            return "off"
-        return str(value)
+    def _normalize_base_topic(cls, value: str) -> str:
+        normalized = value.strip().strip("/")
+        if not normalized:
+            raise ValueError("base_topic must not be empty")
+        return normalized
 
-
-class RemoteDeviceTransportConfig(_RemoteConfigModel):
-    mqtt: RemoteMqttConfig
-
-
-class RemoteTemplateConfig(_RemoteConfigModel):
-    id: str
-    name: str | None = None
-    events: list[RemoteEventMapping] = Field(default_factory=list)
-
-
-class RemoteDeviceCandidate(_RemoteConfigModel):
-    id: str
-    name: str
-    template: str
-    remote: RemoteDeviceTransportConfig
+    @field_validator("dedupe_ms")
+    @classmethod
+    def _normalize_dedupe_ms(cls, value: int) -> int:
+        return max(value, 0)
 
 
 @dataclass(frozen=True, slots=True)
-class MqttBrokerDefaults:
-    hostname: str
-    port: int
-    username: str | None
-    password: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeRemoteMapping:
-    match: str
+class ControlInputEvent:
     control_id: str
-    event_type: RemoteInputEventType
-    direction: Literal["clockwise", "counterclockwise", "left", "right"] | None = None
-
-    def to_control_input_events(self) -> tuple[ControlInputEvent, ...]:
-        if self.event_type == "down":
-            return (
-                ControlInputEvent(
-                    control_id=self.control_id,
-                    capability_id="button.momentary",
-                    event_type="down",
-                    value={"eventType": "down"},
-                ),
-            )
-        if self.event_type == "up":
-            return (
-                ControlInputEvent(
-                    control_id=self.control_id,
-                    capability_id="button.momentary",
-                    event_type="up",
-                    value={"eventType": "up"},
-                ),
-            )
-        if self.event_type == "press":
-            return (
-                ControlInputEvent(
-                    control_id=self.control_id,
-                    capability_id="button.press",
-                    event_type="press",
-                    value={"eventType": "press"},
-                ),
-            )
-        if self.event_type == "rotate":
-            direction = self.direction
-            if direction not in {"clockwise", "counterclockwise"}:
-                raise ValueError(
-                    f"rotate mapping for {self.control_id!r} requires direction"
-                )
-            delta = 1 if direction == "clockwise" else -1
-            return (
-                ControlInputEvent(
-                    control_id=self.control_id,
-                    capability_id="encoder.relative",
-                    event_type="rotate",
-                    value={"delta": delta, "direction": direction},
-                ),
-            )
-        if self.event_type == "tap":
-            return (
-                ControlInputEvent(
-                    control_id=self.control_id,
-                    capability_id="touch.gesture",
-                    event_type="tap",
-                    value={"eventType": "tap"},
-                ),
-            )
-        if self.event_type == "swipe":
-            direction = self.direction
-            if direction not in {"left", "right"}:
-                raise ValueError(
-                    f"swipe mapping for {self.control_id!r} requires direction"
-                )
-            return (
-                ControlInputEvent(
-                    control_id=self.control_id,
-                    capability_id="touch.gesture",
-                    event_type="swipe",
-                    value={"eventType": "swipe", "direction": direction},
-                ),
-            )
-        raise ValueError(f"Unsupported remote event type: {self.event_type}")
-
-
-@dataclass(frozen=True, slots=True)
-class RemoteDeviceRuntime:
-    id: str
-    name: str
-    mqtt_hostname: str
-    mqtt_port: int
-    mqtt_username: str | None
-    mqtt_password: str | None
-    mqtt_topic: str
-    dedupe_ms: int
-    mappings: tuple[RuntimeRemoteMapping, ...]
-
-
-@dataclass(slots=True)
-class RunningRemoteDevice:
-    runtime: RemoteDeviceRuntime
-    cancel_scope: anyio.CancelScope
-    stopped: anyio.Event
-
-
-@dataclass(frozen=True, slots=True)
-class ResetDeviceCommand:
-    pass
-
-
-DeviceCommand = DeckrMessage | ResetDeviceCommand
-InputPublisher = Callable[[DeckrMessage], Awaitable[None]]
-
-
-def _parse_coordinates(control_id: str) -> tuple[int, int]:
-    parts = control_id.split(",")
-    if len(parts) == 2 and all(part.strip("-").isdigit() for part in parts):
-        return int(parts[0]), int(parts[1])
-    return 0, 0
-
-
-def _control_kind_for_events(event_types: set[RemoteInputEventType]) -> str:
-    if "rotate" in event_types:
-        return "encoder"
-    if event_types & {"tap", "swipe"}:
-        return "touch_strip"
-    return "button"
-
-
-def _momentary_button_capability() -> CapabilityDescriptor:
-    return CapabilityDescriptor(
-        capabilityId="button.momentary",
-        family=DECKR_INPUT_BUTTON,
-        type="momentary",
-        direction="input",
-        access=("emits",),
-        valueSchema=button_momentary_value_schema(),
-        eventTypes=("down", "up"),
-    )
-
-
-def _activation_button_capability() -> CapabilityDescriptor:
-    return CapabilityDescriptor(
-        capabilityId="button.press",
-        family=DECKR_INPUT_BUTTON,
-        type="activation",
-        direction="input",
-        access=("emits",),
-        valueSchema=button_activation_value_schema(),
-        eventTypes=("press",),
-    )
-
-
-def _encoder_capability() -> CapabilityDescriptor:
-    return CapabilityDescriptor.model_validate(
-        {
-            "capabilityId": "encoder.relative",
-            "family": DECKR_INPUT_ENCODER,
-            "type": "relative",
-            "direction": "input",
-            "access": ["emits"],
-            "valueSchema": encoder_relative_value_schema().model_dump(
-                by_alias=True,
-                exclude_none=True,
-                mode="json",
-            ),
-            "eventTypes": ["rotate"],
-            "constraints": [
-                {
-                    "type": "range",
-                    "subject": "delta",
-                    "minimum": -24,
-                    "maximum": 24,
-                    "step": 1,
-                    "unit": "detent",
-                }
-            ],
-            "units": [{"subject": "delta", "unit": "detent"}],
-        }
-    )
-
-
-def _touch_capability() -> CapabilityDescriptor:
-    return CapabilityDescriptor(
-        capabilityId="touch.gesture",
-        family=DECKR_INPUT_TOUCH,
-        type="gesture",
-        direction="input",
-        access=("emits",),
-        valueSchema=touch_gesture_value_schema(),
-        eventTypes=("tap", "swipe"),
-    )
-
-
-def build_controls(mappings: list[RemoteEventMapping]) -> list[ControlDescriptor]:
-    by_control: dict[str, set[RemoteInputEventType]] = defaultdict(set)
-    for mapping in mappings:
-        by_control[mapping.control_id].add(mapping.event_type)
-    controls = []
-    for control_id, event_types in sorted(
-        by_control.items(),
-        key=lambda item: (
-            _parse_coordinates(item[0])[1],
-            _parse_coordinates(item[0])[0],
-            item[0],
-        ),
-    ):
-        column, row = _parse_coordinates(control_id)
-        capabilities: list[CapabilityDescriptor] = []
-        if "down" in event_types or "up" in event_types:
-            capabilities.append(_momentary_button_capability())
-        if "press" in event_types:
-            capabilities.append(_activation_button_capability())
-        if "rotate" in event_types:
-            capabilities.append(_encoder_capability())
-        if event_types & {"tap", "swipe"}:
-            capabilities.append(_touch_capability())
-        controls.append(
-            ControlDescriptor(
-                controlId=control_id,
-                kind=_control_kind_for_events(event_types),
-                label=control_id,
-                geometry=ControlGeometry(x=column, y=row, width=1, height=1, unit="grid"),
-                inputCapabilities=tuple(capabilities),
-                sources=(),
-            )
-        )
-    return controls
-
-
-def _extract_action_values(payload: bytes | str) -> list[str]:
-    if isinstance(payload, bytes):
-        raw = payload.decode("utf-8").strip()
-    else:
-        raw = payload.strip()
-
-    if not raw:
-        return []
-
-    values: list[str] = [raw]
-    try:
-        data = json.loads(raw)
-    except json.JSONDecodeError:
-        return values
-
-    if isinstance(data, str):
-        values.append(data)
-    elif isinstance(data, dict):
-        action = data.get("action")
-        if isinstance(action, str) and action:
-            values.append(action)
-
-    # Preserve order while dropping duplicates.
-    return list(dict.fromkeys(values))
-
-
-def load_mqtt_broker_defaults(
-    config: Mapping[str, Any] | None = None,
-) -> MqttBrokerDefaults:
-    """Defaults for remote MQTT broker fields."""
-    if config is not None:
-        driver_config = DriverBrokerConfig.model_validate(dict(config.get("broker") or {}))
-        return MqttBrokerDefaults(
-            hostname=driver_config.hostname,
-            port=driver_config.port,
-            username=driver_config.username,
-            password=driver_config.password,
-        )
-
-    hostname = decouple_config("MQTT_HOSTNAME", default="").strip()
-    port = decouple_config("MQTT_PORT", default=1883, cast=int)
-    username = decouple_config("MQTT_USERNAME", default="").strip() or None
-    password = (
-        decouple_config("MQTT_PASSWORD", default="").strip() if username else None
-    )
-    return MqttBrokerDefaults(
-        hostname=hostname,
-        port=port,
-        username=username,
-        password=password,
-    )
-
-
-def load_driver_config(
-    config: Mapping[str, Any] | None = None,
-    *,
-    base_dir: Path | None = None,
-) -> DriverConfig:
-    driver_config = DriverConfig.model_validate(dict(config or {}))
-    driver_config.devices_path = _resolve_config_path(
-        driver_config.devices_path or DEFAULT_DEVICES_DIR,
-        base_dir=base_dir,
-    )
-    driver_config.templates_path = _resolve_config_path(
-        driver_config.templates_path or DEFAULT_TEMPLATES_DIR,
-        base_dir=base_dir,
-    )
-    return driver_config
-
-
-def _resolve_config_path(value: Path | str, *, base_dir: Path | None = None) -> Path:
-    path = Path(value).expanduser()
-    if not path.is_absolute() and base_dir is not None:
-        path = base_dir / path
-    return path.resolve()
+    capability_id: str
+    event_type: str
+    value: dict[str, Any]
 
 
 class Deduper:
@@ -481,301 +132,90 @@ class Deduper:
         return (now - last_seen) * 1000 >= self._dedupe_ms
 
 
-def _load_remote_device(
-    path: Path,
-    *,
-    templates: Mapping[str, RemoteTemplateConfig],
-    default_mqtt: MqttBrokerDefaults,
-) -> RemoteDeviceRuntime | None:
-    try:
-        data = yaml.safe_load(path.read_text())
-    except Exception:
-        logger.exception("Failed to read remote config from %s", path)
-        return None
+@dataclass(slots=True)
+class Zigbee2MqttDeviceRuntime:
+    device: Zigbee2MqttDevice
+    descriptor: DeviceDescriptor
+    mappings_by_action: Mapping[str, InferredAction]
+    deduper: Deduper
+    active_axes: dict[str, str] = field(default_factory=dict)
 
-    if not isinstance(data, dict) or "remote" not in data:
-        return None
+    @property
+    def id(self) -> str:
+        return self.device.device_id
 
-    try:
-        candidate = RemoteDeviceCandidate.model_validate(data)
-    except Exception:
-        logger.exception("Invalid remote device config in %s", path)
-        return None
+    @property
+    def topic(self) -> str:
+        return self.device.topic
 
-    template = templates.get(candidate.template)
-    if template is None:
-        logger.warning(
-            "Skipping remote config %s because template %r is not available",
-            path,
-            candidate.template,
-        )
-        return None
+    @property
+    def fingerprint(self) -> str:
+        return self.device.fingerprint
 
-    mappings = tuple(
-        RuntimeRemoteMapping(
-            match=mapping.match,
-            control_id=mapping.control_id,
+    def events_for_payload(self, payload: bytes | str) -> tuple[ControlInputEvent, ...]:
+        events: list[ControlInputEvent] = []
+        for action in extract_action_values(payload):
+            mapping = self.mappings_by_action.get(action)
+            if mapping is None:
+                logger.debug(
+                    "Ignoring unmapped Zigbee2MQTT action %s for %s",
+                    action,
+                    self.device.friendly_name,
+                )
+                continue
+            if not mapping.stop and not self.deduper.should_emit(action):
+                continue
+            event = self._event_for_mapping(mapping)
+            if event is not None:
+                logger.debug(
+                    "Mapped Zigbee2MQTT action %s for %s to %s/%s/%s",
+                    action,
+                    self.device.friendly_name,
+                    event.control_id,
+                    event.capability_id,
+                    event.event_type,
+                )
+                events.append(event)
+        return tuple(events)
+
+    def _event_for_mapping(
+        self,
+        mapping: InferredAction,
+    ) -> ControlInputEvent | None:
+        control_id = mapping.control_id
+        if mapping.stop:
+            if mapping.axis is None:
+                return None
+            control_id = self.active_axes.pop(mapping.axis, None)
+            if control_id is None:
+                logger.debug(
+                    "Dropping Zigbee2MQTT stop action %s without active direction",
+                    mapping.action,
+                )
+                return None
+        elif mapping.axis is not None and mapping.event_type == "down":
+            self.active_axes[mapping.axis] = mapping.control_id or ""
+
+        if not control_id:
+            return None
+        return ControlInputEvent(
+            control_id=control_id,
+            capability_id=mapping.capability_id,
             event_type=mapping.event_type,
-            direction=mapping.direction,
+            value={"eventType": mapping.event_type},
         )
-        for mapping in template.events
-    )
-    if not mappings:
-        logger.warning(
-            "Skipping remote config %s because template %r has no events",
-            path,
-            candidate.template,
-        )
-        return None
-
-    hostname = default_mqtt.hostname
-    port = default_mqtt.port
-    username = default_mqtt.username
-    password = default_mqtt.password
-    if not hostname:
-        logger.warning(
-            "Skipping remote config %s because no MQTT hostname is configured",
-            path,
-        )
-        return None
-
-    return RemoteDeviceRuntime(
-        id=candidate.id,
-        name=candidate.name,
-        mqtt_hostname=hostname,
-        mqtt_port=port,
-        mqtt_username=username,
-        mqtt_password=password,
-        mqtt_topic=candidate.remote.mqtt.topic,
-        dedupe_ms=max(candidate.remote.mqtt.dedupe_ms, 0),
-        mappings=mappings,
-    )
 
 
-def _load_remote_template(path: Path) -> RemoteTemplateConfig | None:
-    try:
-        data = yaml.safe_load(path.read_text())
-    except Exception:
-        logger.exception("Failed to read remote template from %s", path)
-        return None
-
-    try:
-        template = RemoteTemplateConfig.model_validate(data)
-    except Exception:
-        logger.exception("Invalid remote template config in %s", path)
-        return None
-    return template
-
-
-def load_remote_templates(
-    templates_dir: Path = DEFAULT_TEMPLATES_DIR,
-) -> dict[str, RemoteTemplateConfig]:
-    templates: dict[str, RemoteTemplateConfig] = {}
-    for pattern in ("*.yml", "*.yaml"):
-        for path in sorted(templates_dir.glob(pattern)):
-            template = _load_remote_template(path)
-            if template is None:
-                continue
-            if template.id in templates:
-                logger.error(
-                    "Ignoring duplicate remote template id %r in %s",
-                    template.id,
-                    path,
-                )
-                continue
-            templates[template.id] = template
-    return templates
-
-
-def load_remote_devices(
-    devices_dir: Path = DEFAULT_DEVICES_DIR,
+def load_driver_config(
+    config: Mapping[str, Any] | None = None,
     *,
-    templates_dir: Path = DEFAULT_TEMPLATES_DIR,
-    default_mqtt: MqttBrokerDefaults | None = None,
-) -> list[RemoteDeviceRuntime]:
-    devices: list[RemoteDeviceRuntime] = []
-    mqtt_defaults = default_mqtt or load_mqtt_broker_defaults()
-    templates = load_remote_templates(templates_dir)
-    for pattern in ("*.yml", "*.yaml"):
-        for path in sorted(devices_dir.glob(pattern)):
-            device = _load_remote_device(
-                path,
-                templates=templates,
-                default_mqtt=mqtt_defaults,
-            )
-            if device is not None:
-                devices.append(device)
-    return devices
+    base_dir: Path | None = None,
+) -> DriverConfig:
+    del base_dir
+    return DriverConfig.model_validate(dict(config or {}))
 
 
-def _yaml_filter(change: Change, path: str) -> bool:
-    return path.endswith(".yml") or path.endswith(".yaml")
-
-
-async def _forward_device_events(
-    device: RemoteDevice,
-    publish_input: InputPublisher,
-    manager_id: str,
-    sender_session_id: str,
-) -> None:
-    async for event in device.subscribe():
-        await publish_input(
-            hw_messages.control_input_message(
-                manager_id=manager_id,
-                sender_session_id=sender_session_id,
-                device_id=device.id,
-                fingerprint=device.hid,
-                control_id=event.control_id,
-                capability_id=event.capability_id,
-                event_type=event.event_type,
-                value=event.value,
-            )
-        )
-
-
-async def _run_until_complete(cancel_scope, func, *args) -> None:
-    try:
-        await func(*args)
-    finally:
-        cancel_scope.cancel()
-
-
-async def _apply_device_commands(
-    device: RemoteDevice,
-    command_stream: anyio.abc.ObjectReceiveStream[DeviceCommand],
-    manager_id: str,
-) -> None:
-    async for command in command_stream:
-        if isinstance(command, ResetDeviceCommand):
-            continue
-        envelope = command
-        ref = hw_messages.hardware_device_ref_from_message(envelope)
-        if ref is None or ref.manager_id != manager_id or ref.device_id != device.id:
-            continue
-        message = hw_messages.hardware_body_from_message(envelope)
-        if not isinstance(message, hw_messages.ControlCommandMessage):
-            continue
-        if message.capability_id != "raster.bitmap" or message.control_id is None:
-            continue
-        try:
-            params = raster_bitmap_command_params(message.command_type, message.params)
-        except (ValueError, ValidationError) as exc:
-            logger.warning("Ignoring invalid raster command params: %s", exc)
-            continue
-        if isinstance(params, RasterBitmapSetFrameParams):
-            try:
-                await device.set_raster_frame(
-                    message.control_id,
-                    base64.b64decode(params.image, validate=True),
-                )
-            except (ValueError, binascii.Error) as exc:
-                logger.warning("Ignoring invalid raster image payload: %s", exc)
-        elif isinstance(params, RasterBitmapClearParams):
-            await device.clear_raster(message.control_id)
-
-
-async def _mqtt_loop(
-    runtime: RemoteDeviceRuntime,
-    device: RemoteDevice,
-    *,
-    hostname: str,
-    port: int,
-    username: str | None,
-    password: str | None,
-) -> None:
-    backoff = 1.0
-    deduper = Deduper(runtime.dedupe_ms)
-    mappings_by_value: dict[str, list[RuntimeRemoteMapping]] = defaultdict(list)
-    for mapping in runtime.mappings:
-        mappings_by_value[mapping.match].append(mapping)
-
-    cancelled_exc = anyio.get_cancelled_exc_class()
-    while True:
-        try:
-            async with aiomqtt.Client(
-                hostname,
-                port=port,
-                username=username,
-                password=password,
-            ) as client:
-                await client.subscribe(runtime.mqtt_topic, qos=QOS)
-                logger.info(
-                    "Remote device %s subscribed to MQTT topic %s",
-                    runtime.id,
-                    runtime.mqtt_topic,
-                )
-                backoff = 1.0
-                async for message in client.messages:
-                    values = _extract_action_values(message.payload)
-                    for value in values:
-                        matched = mappings_by_value.get(value, [])
-                        if not matched:
-                            continue
-                        if not deduper.should_emit(value):
-                            continue
-                        for mapping in matched:
-                            for event in mapping.to_control_input_events():
-                                await device.emit(event)
-        except cancelled_exc:
-            raise
-        except Exception:
-            logger.exception(
-                "Remote device %s disconnected from MQTT; retrying in %.1fs",
-                runtime.id,
-                backoff,
-            )
-            await anyio.sleep(backoff)
-            backoff = min(backoff * 2.0, 10.0)
-
-
-async def device_loop(
-    runtime: RemoteDeviceRuntime,
-    publish_input: InputPublisher,
-    command_stream: anyio.abc.ObjectReceiveStream[DeviceCommand],
-    manager_id: str,
-    sender_session_id: str,
-) -> None:
-    device = RemoteDevice(
-        device_id=runtime.id,
-        name=runtime.name,
-    )
-
-    try:
-
-        async def run_mqtt_loop() -> None:
-            await _mqtt_loop(
-                runtime,
-                device,
-                hostname=runtime.mqtt_hostname,
-                port=runtime.mqtt_port,
-                username=runtime.mqtt_username,
-                password=runtime.mqtt_password,
-            )
-
-        async with anyio.create_task_group() as tg:
-            tg.start_soon(
-                _run_until_complete,
-                tg.cancel_scope,
-                _forward_device_events,
-                device,
-                publish_input,
-                manager_id,
-                sender_session_id,
-            )
-            tg.start_soon(
-                _run_until_complete,
-                tg.cancel_scope,
-                _apply_device_commands,
-                device,
-                command_stream,
-                manager_id,
-            )
-            tg.start_soon(_run_until_complete, tg.cancel_scope, run_mqtt_loop)
-    finally:
-        await device.close()
-
-
-class RemoteDeviceFactoryComponent(BaseComponent):
+class Zigbee2MqttHardwareManager(BaseComponent):
     def __init__(
         self,
         hardware_lane: Lane,
@@ -783,19 +223,19 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         discovery_state: StateStore,
         *,
         manager_id: str,
-        devices_dir: Path = DEFAULT_DEVICES_DIR,
-        templates_dir: Path = DEFAULT_TEMPLATES_DIR,
-        default_mqtt: MqttBrokerDefaults | None = None,
+        base_topic: str = DEFAULT_BASE_TOPIC,
+        dedupe_ms: int = DEFAULT_DEDUPE_MS,
+        broker: DriverBrokerConfig | None = None,
         labels: Mapping[str, str] | None = None,
     ):
-        super().__init__(name="remote_device_factory")
+        super().__init__(name="zigbee2mqtt_hardware_manager")
         self._hardware_lane = hardware_lane
         self._lease_state = lease_state
         self._discovery_state = discovery_state
         self._manager_id = manager_id
-        self._devices_dir = devices_dir
-        self._templates_dir = templates_dir
-        self._default_mqtt = default_mqtt or load_mqtt_broker_defaults()
+        self._base_topic = base_topic.strip().strip("/") or DEFAULT_BASE_TOPIC
+        self._dedupe_ms = max(dedupe_ms, 0)
+        self._broker = broker or DriverBrokerConfig()
         self._labels = dict(labels or {})
         self._session_id = ""
         self._cancel_scope: anyio.CancelScope | None = None
@@ -803,14 +243,12 @@ class RemoteDeviceFactoryComponent(BaseComponent):
             AbstractAsyncContextManager[RegisteredEndpointLane] | None
         ) = None
         self._endpoint: RegisteredEndpointLane | None = None
-        self._task_group: anyio.abc.TaskGroup | None = None
         self._stop_event: anyio.Event | None = None
-        self._running_devices: dict[str, RunningRemoteDevice] = {}
+        self._runtimes: dict[str, Zigbee2MqttDeviceRuntime] = {}
+        self._runtime_by_topic: dict[str, Zigbee2MqttDeviceRuntime] = {}
         self._devices: dict[str, DeviceDescriptor] = {}
         self._claims: dict[str, DeviceClaim] = {}
         self._controller_presence_sessions: dict[EndpointAddress, str] = {}
-        self._unroutable_devices: set[str] = set()
-        self._command_streams: dict[str, anyio.abc.ObjectSendStream[DeviceCommand]] = {}
         self._inventory_revision: int | None = None
         self._inventory_dirty = False
         self._routing_reconcile_lock = anyio.Lock()
@@ -825,16 +263,14 @@ class RemoteDeviceFactoryComponent(BaseComponent):
             self._endpoint = await self._endpoint_cm.__aenter__()
             self._session_id = self._endpoint.session_id
             self._cancel_scope = ctx.tg.cancel_scope
-            self._task_group = ctx.tg
             self._stop_event = anyio.Event()
-            await self._reconcile_devices()
             await self._publish_inventory_safely()
             ctx.tg.start_soon(self._command_subscription_loop)
             ctx.tg.start_soon(self._claim_watch_loop)
             ctx.tg.start_soon(self._controller_presence_loop)
             ctx.tg.start_soon(self._routing_reconciliation_loop)
             ctx.tg.start_soon(self._inventory_retry_loop)
-            ctx.tg.start_soon(self._watch_loop)
+            ctx.tg.start_soon(self._mqtt_discovery_loop)
         except BaseException:
             with anyio.CancelScope(shield=True):
                 await self._withdraw_inventory()
@@ -847,145 +283,172 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 self._stop_event.set()
             if self._cancel_scope is not None:
                 self._cancel_scope.cancel()
+            self._runtimes.clear()
+            self._runtime_by_topic.clear()
             self._devices.clear()
             self._claims.clear()
-            self._unroutable_devices.clear()
             await self._withdraw_inventory()
             await self._close_endpoint()
 
-    async def _run_device(self, runtime: RemoteDeviceRuntime) -> None:
-        stopped = anyio.Event()
-        command_send, command_receive = anyio.create_memory_object_stream[
-            DeviceCommand
-        ](max_buffer_size=100)
-        with anyio.CancelScope() as scope:
-            self._running_devices[runtime.id] = RunningRemoteDevice(
-                runtime=runtime,
-                cancel_scope=scope,
-                stopped=stopped,
-            )
-            self._command_streams[runtime.id] = command_send
+    async def _mqtt_discovery_loop(self) -> None:
+        if not self._broker.hostname:
+            logger.warning("MQTT hardware manager has no broker hostname configured")
+            return
+
+        backoff = 1.0
+        cancelled_exc = anyio.get_cancelled_exc_class()
+        bridge_topic = f"{self._base_topic}/bridge/devices"
+        while True:
+            subscribed_device_topics: set[str] = set()
             try:
-                async with command_send, command_receive:
-                        await device_loop(
-                            runtime,
-                            self._handle_device_message,
-                            command_receive,
-                            self._manager_id,
-                            self._session_id,
-                        )
-            finally:
-                self._command_streams.pop(runtime.id, None)
-                stopped.set()
-                current = self._running_devices.get(runtime.id)
-                if current is not None and current.stopped is stopped:
-                    del self._running_devices[runtime.id]
-
-    async def _stop_device(self, device_id: str) -> None:
-        running = self._running_devices.get(device_id)
-        if running is None:
-            return
-        running.cancel_scope.cancel()
-        await running.stopped.wait()
-
-    async def _start_device(self, runtime: RemoteDeviceRuntime) -> None:
-        if self._task_group is None:
-            return
-        self._task_group.start_soon(self._run_device, runtime)
-
-    async def _reconcile_devices(self) -> None:
-        desired = {
-            runtime.id: runtime
-            for runtime in load_remote_devices(
-                self._devices_dir,
-                templates_dir=self._templates_dir,
-                default_mqtt=self._default_mqtt,
-            )
-        }
-        running_ids = set(self._running_devices)
-        desired_ids = set(desired)
-        changed_ids = {
-            device_id
-            for device_id, runtime in desired.items()
-            if self._running_devices.get(device_id) is not None
-            and self._running_devices[device_id].runtime != runtime
-        }
-
-        for device_id in sorted((running_ids - desired_ids) | changed_ids):
-            await self._stop_device(device_id)
-
-        next_devices = {
-            device_id: _hardware_device_from_runtime(runtime)
-            for device_id, runtime in desired.items()
-        }
-        if next_devices != self._devices:
-            removed_devices = set(self._devices) - set(next_devices)
-            previous_devices = self._devices
-            self._devices = next_devices
-            for device_id in removed_devices:
-                self._claims.pop(device_id, None)
-                self._unroutable_devices.discard(device_id)
-            await self._publish_inventory_safely()
-            if self._endpoint is not None:
-                for device_id in sorted(removed_devices):
-                    await self._endpoint.publish(
-                        hw_messages.device_unavailable_message(
-                            manager_id=self._manager_id,
-                            sender_session_id=self._endpoint.session_id,
-                            device_id=device_id,
-                            reason="removed",
-                        )
+                async with aiomqtt.Client(
+                    self._broker.hostname,
+                    port=self._broker.port,
+                    username=self._broker.username,
+                    password=self._broker.password,
+                ) as client:
+                    await client.subscribe(bridge_topic, qos=QOS)
+                    logger.info(
+                        "Zigbee2MQTT manager %s subscribed to %s",
+                        self._manager_id,
+                        bridge_topic,
                     )
-                for device_id, descriptor in sorted(next_devices.items()):
-                    if device_id not in previous_devices:
-                        await self._endpoint.publish(
-                            hw_messages.device_available_message(
-                                manager_id=self._manager_id,
-                                sender_session_id=self._endpoint.session_id,
-                                descriptor=descriptor,
+                    backoff = 1.0
+                    async for message in client.messages:
+                        message_topic = topic_text(message.topic)
+                        if message_topic == bridge_topic:
+                            await self._handle_bridge_devices_payload(
+                                message.payload,
+                                client=client,
+                                subscribed_device_topics=subscribed_device_topics,
                             )
+                            continue
+                        await self._handle_mqtt_device_payload(
+                            topic=message_topic,
+                            payload=message.payload,
                         )
-                    elif previous_devices[device_id] != descriptor:
-                        await self._endpoint.publish(
-                            hw_messages.device_descriptor_changed_message(
-                                manager_id=self._manager_id,
-                                sender_session_id=self._endpoint.session_id,
-                                descriptor=descriptor,
-                            )
-                        )
+            except cancelled_exc:
+                raise
+            except Exception:
+                logger.exception(
+                    "Zigbee2MQTT manager %s disconnected; retrying in %.1fs",
+                    self._manager_id,
+                    backoff,
+                )
+                await anyio.sleep(backoff)
+                backoff = min(backoff * 2.0, 10.0)
 
-        for device_id, runtime in desired.items():
-            current = self._running_devices.get(device_id)
-            if current is None:
-                await self._start_device(runtime)
-                continue
-
-    async def _watch_loop(self) -> None:
-        if self._stop_event is None:
-            return
-        watch_paths = tuple(
-            path for path in (self._devices_dir, self._templates_dir) if path.exists()
-        )
-        if not watch_paths:
-            logger.warning(
-                "No MQTT remote config directories exist: %s, %s",
-                self._devices_dir,
-                self._templates_dir,
-            )
-            await self._stop_event.wait()
-            return
+    async def _handle_bridge_devices_payload(
+        self,
+        payload: bytes | str,
+        *,
+        client: aiomqtt.Client,
+        subscribed_device_topics: set[str],
+    ) -> None:
         try:
-            async for _changes in awatch(
-                *watch_paths,
-                watch_filter=_yaml_filter,
-                recursive=False,
-                stop_event=self._stop_event,
-            ):
-                await self._reconcile_devices()
-        except anyio.get_cancelled_exc_class():
-            raise
+            devices = parse_bridge_devices(payload, base_topic=self._base_topic)
         except Exception:
-            logger.exception("Remote device config watch loop failed")
+            logger.exception("Ignoring invalid Zigbee2MQTT bridge/devices payload")
+            return
+        await self._reconcile_discovered_devices(devices)
+        desired_topics = {runtime.topic for runtime in self._runtimes.values()}
+        for topic in sorted(desired_topics - subscribed_device_topics):
+            await client.subscribe(topic, qos=QOS)
+            subscribed_device_topics.add(topic)
+        for topic in sorted(subscribed_device_topics - desired_topics):
+            try:
+                await client.unsubscribe(topic)
+            except Exception:
+                logger.debug("Could not unsubscribe from removed MQTT topic %s", topic)
+            subscribed_device_topics.discard(topic)
+
+    async def _handle_mqtt_device_payload(self, *, topic: str, payload: bytes | str) -> None:
+        runtime = self._runtime_by_topic.get(topic)
+        if runtime is None:
+            return
+        for event in runtime.events_for_payload(payload):
+            await self._publish_control_input(runtime, event)
+
+    async def _publish_control_input(
+        self,
+        runtime: Zigbee2MqttDeviceRuntime,
+        event: ControlInputEvent,
+    ) -> None:
+        await self._handle_device_message(
+            hw_messages.control_input_message(
+                manager_id=self._manager_id,
+                sender_session_id=self._session_id,
+                device_id=runtime.id,
+                fingerprint=runtime.fingerprint,
+                control_id=event.control_id,
+                capability_id=event.capability_id,
+                event_type=event.event_type,
+                value=event.value,
+            )
+        )
+
+    async def _reconcile_discovered_devices(
+        self,
+        devices: tuple[Zigbee2MqttDevice, ...],
+    ) -> None:
+        desired: dict[str, Zigbee2MqttDeviceRuntime] = {}
+        for device in devices:
+            runtime = _runtime_from_zigbee2mqtt_device(device, dedupe_ms=self._dedupe_ms)
+            if runtime is None:
+                continue
+            previous = self._runtimes.get(runtime.id)
+            if (
+                previous is not None
+                and previous.topic == runtime.topic
+                and previous.descriptor == runtime.descriptor
+                and previous.mappings_by_action == runtime.mappings_by_action
+            ):
+                desired[runtime.id] = previous
+            else:
+                desired[runtime.id] = runtime
+
+        previous_devices = self._devices
+        next_devices = {
+            device_id: runtime.descriptor for device_id, runtime in desired.items()
+        }
+        self._runtimes = desired
+        self._runtime_by_topic = {runtime.topic: runtime for runtime in desired.values()}
+        if next_devices == previous_devices:
+            return
+
+        removed_devices = set(previous_devices) - set(next_devices)
+        self._devices = next_devices
+        for device_id in removed_devices:
+            self._claims.pop(device_id, None)
+        await self._publish_inventory_safely()
+        if self._endpoint is None:
+            return
+        for device_id in sorted(removed_devices):
+            await self._endpoint.publish(
+                hw_messages.device_unavailable_message(
+                    manager_id=self._manager_id,
+                    sender_session_id=self._endpoint.session_id,
+                    device_id=device_id,
+                    reason="removed",
+                )
+            )
+        for device_id, descriptor in sorted(next_devices.items()):
+            if device_id not in previous_devices:
+                await self._endpoint.publish(
+                    hw_messages.device_available_message(
+                        manager_id=self._manager_id,
+                        sender_session_id=self._endpoint.session_id,
+                        descriptor=descriptor,
+                    )
+                )
+            elif previous_devices[device_id] != descriptor:
+                await self._endpoint.publish(
+                    hw_messages.device_descriptor_changed_message(
+                        manager_id=self._manager_id,
+                        sender_session_id=self._endpoint.session_id,
+                        descriptor=descriptor,
+                    )
+                )
 
     async def _close_endpoint(self) -> None:
         endpoint_cm = self._endpoint_cm
@@ -1170,7 +633,6 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         )
 
         next_claims = dict(self._claims)
-        invalid_claim_devices: set[str] = set()
         next_controller_sessions = dict(self._controller_presence_sessions)
 
         for key in claim_observation.confirmed_missing:
@@ -1192,7 +654,6 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 next_claims[device_id] = DeviceClaim.model_validate(entry.value)
             except ValueError:
                 logger.warning("Ignoring invalid MQTT device claim %s", entry.key)
-                invalid_claim_devices.add(device_id)
                 next_claims.pop(device_id, None)
 
         for key in presence_observation.confirmed_missing:
@@ -1224,65 +685,14 @@ class RemoteDeviceFactoryComponent(BaseComponent):
             next_controller_sessions[endpoint] = presence.session_id
 
         logger.debug("Reconciling MQTT routing current state via %s", reason)
-        devices_to_reset = self._devices_to_reset_for_routing_snapshot(
-            next_claims,
-            next_controller_sessions,
-            invalid_claim_devices,
-        )
         self._claims = next_claims
         self._controller_presence_sessions = next_controller_sessions
-        self._unroutable_devices = {
-            device_id
-            for device_id, claim in next_claims.items()
-            if _claim_recipient(claim, next_controller_sessions) is None
-        }
-        for device_id in sorted(devices_to_reset):
-            await self._reset_device(device_id)
-
-    def _devices_to_reset_for_routing_snapshot(
-        self,
-        next_claims: dict[str, DeviceClaim],
-        next_controller_sessions: dict[EndpointAddress, str],
-        invalid_claim_devices: set[str],
-    ) -> set[str]:
-        devices_to_reset = set(invalid_claim_devices)
-        for device_id, old_claim in self._claims.items():
-            next_claim = next_claims.get(device_id)
-            if next_claim is None:
-                devices_to_reset.add(device_id)
-                continue
-            if _claim_route_identity(old_claim) != _claim_route_identity(next_claim):
-                devices_to_reset.add(device_id)
-                continue
-            if (
-                _claim_recipient(old_claim, self._controller_presence_sessions)
-                is not None
-                and _claim_recipient(next_claim, next_controller_sessions) is None
-            ):
-                devices_to_reset.add(device_id)
-
-        for device_id, next_claim in next_claims.items():
-            if (
-                device_id not in self._claims
-                and _claim_recipient(next_claim, next_controller_sessions) is None
-            ):
-                devices_to_reset.add(device_id)
-        return devices_to_reset
 
     def _claim_recipient(self, device_id: str) -> EndpointAddress | None:
         claim = self._claims.get(device_id)
         if claim is None:
             return None
         return _claim_recipient(claim, self._controller_presence_sessions)
-
-    async def _reset_device(self, device_id: str) -> None:
-        stream = self._command_streams.get(device_id)
-        if stream is None:
-            return
-        try:
-            await stream.send(ResetDeviceCommand())
-        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
-            logger.debug("Could not reset closed MQTT device session %s", device_id)
 
     async def _command_subscription_loop(self) -> None:
         if self._endpoint is None:
@@ -1323,52 +733,68 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 envelope.sender,
             )
             return
-        command_stream = self._command_streams.get(ref.device_id)
-        if command_stream is None:
-            logger.debug(
-                "Dropping command for closed MQTT device %s/%s",
-                ref.manager_id,
-                ref.device_id,
-            )
-            return
-        await command_stream.send(envelope)
+        logger.debug(
+            "Dropping command for input-only Zigbee2MQTT device %s/%s",
+            ref.manager_id,
+            ref.device_id,
+        )
 
 
-def _hardware_device_from_runtime(
-    runtime: RemoteDeviceRuntime,
-) -> DeviceDescriptor:
-    controls = build_controls(
-        [
-            RemoteEventMapping(
-                match=mapping.match,
-                control_id=mapping.control_id,
-                event_type=mapping.event_type,
-                direction=mapping.direction,
-            )
-            for mapping in runtime.mappings
-        ]
+def _runtime_from_zigbee2mqtt_device(
+    device: Zigbee2MqttDevice,
+    *,
+    dedupe_ms: int,
+) -> Zigbee2MqttDeviceRuntime | None:
+    if not device.is_action_device:
+        return None
+    mappings = infer_actions(device.actions)
+    if not any(mapping.control_id is not None for mapping in mappings):
+        logger.debug(
+            "Skipping Zigbee2MQTT device %s because no actions could be inferred",
+            device.friendly_name,
+        )
+        return None
+    descriptor = _hardware_device_from_zigbee2mqtt_device(device)
+    return Zigbee2MqttDeviceRuntime(
+        device=device,
+        descriptor=descriptor,
+        mappings_by_action={mapping.action: mapping for mapping in mappings},
+        deduper=Deduper(dedupe_ms),
     )
+
+
+def _hardware_device_from_zigbee2mqtt_device(
+    device: Zigbee2MqttDevice,
+) -> DeviceDescriptor:
     return DeviceDescriptor(
-        deviceId=runtime.id,
-        fingerprint=runtime.id,
-        displayName=runtime.name,
-        manufacturer="Deckr",
-        model="MQTT Remote",
+        deviceId=device.device_id,
+        fingerprint=device.fingerprint,
+        displayName=device.display_name,
+        manufacturer=device.vendor or "Zigbee2MQTT",
+        model=device.model or device.model_id or "Zigbee2MQTT action device",
+        modelId=device.model_id,
+        serialNumber=device.ieee_address,
         connections=(
             DeviceConnection(
-                connectionId=f"mqtt-{runtime.id}",
+                connectionId=f"mqtt-{device.device_id}",
                 type="mqtt",
                 status="available",
                 transport="mqtt",
-                facts={"topic": runtime.mqtt_topic},
+                facts={
+                    key: value
+                    for key, value in {
+                        "topic": device.topic,
+                        "friendly_name": device.friendly_name,
+                        "ieee_address": device.ieee_address,
+                        "power_source": device.power_source,
+                        "interview_state": device.interview_state,
+                    }.items()
+                    if value is not None
+                },
             ),
         ),
-        controls=tuple(controls),
+        controls=build_controls(device.actions),
     )
-
-
-def _claim_route_identity(claim: DeviceClaim) -> tuple[EndpointAddress, str]:
-    return claim.claimed_by_endpoint, claim.claimed_by_session_id
 
 
 def _claim_recipient(
@@ -1391,19 +817,14 @@ def driver_factory(
     config_base_dir: Path | None = None,
 ):
     driver_config = load_driver_config(config, base_dir=config_base_dir)
-    return RemoteDeviceFactoryComponent(
+    return Zigbee2MqttHardwareManager(
         hardware_lane,
         lease_state,
         discovery_state,
         manager_id=manager_id,
-        devices_dir=driver_config.devices_path or DEFAULT_DEVICES_DIR,
-        templates_dir=driver_config.templates_path or DEFAULT_TEMPLATES_DIR,
-        default_mqtt=MqttBrokerDefaults(
-            hostname=driver_config.broker.hostname,
-            port=driver_config.broker.port,
-            username=driver_config.broker.username,
-            password=driver_config.broker.password,
-        ),
+        base_topic=driver_config.base_topic,
+        dedupe_ms=driver_config.dedupe_ms,
+        broker=driver_config.broker,
         labels=driver_config.labels,
     )
 
