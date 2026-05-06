@@ -17,7 +17,8 @@ instance_id = "mqtt-openhabian"
 hardware_manager = "mqtt-openhabian"
 
 [deckr.components.instances.mqtt_openhabian.config]
-config_path = "../mqtt/openhabian"
+devices_path = "../hardware/mqtt/openhabian/devices"
+templates_path = "../hardware/mqtt/templates"
 
 [deckr.components.instances.mqtt_openhabian.config.broker]
 hostname = "openhabian"
@@ -27,8 +28,31 @@ port = 1883
 mqtt-host = "openhabian"
 ```
 
-Remote device YAML under `config_path` describes the device topic and event
-mapping only. Per-device broker overrides are not supported.
+Remote device YAML under `devices_path` describes the physical or virtual remote
+instance and MQTT topic. It references a reusable template from
+`templates_path`, which owns the control layout and MQTT action-to-Deckr event
+mapping. Per-device broker overrides are not supported.
+
+```yaml
+# devices_path/remote-bedroom.yml
+id: remote-0x0330
+name: Bedroom remote
+template: zigbee2mqtt-5-button-remote
+remote:
+  mqtt:
+    topic: zigbee2mqtt/remote/0x0330/action
+    dedupe_ms: 250
+```
+
+```yaml
+# templates_path/zigbee2mqtt-5-button-remote.yml
+id: zigbee2mqtt-5-button-remote
+name: Zigbee2MQTT 5-button remote
+events:
+  - match: off
+    control_id: volume-power
+    event_type: press
+```
 
 ## Development
 

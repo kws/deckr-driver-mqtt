@@ -122,7 +122,8 @@ def _factory(deckr: Deckr, config_dir: Path) -> RemoteDeviceFactoryComponent:
         deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
         deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
         manager_id="mqtt-main",
-        config_dir=config_dir,
+        devices_dir=config_dir,
+        templates_dir=config_dir / "templates",
         default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",
             port=1883,
@@ -175,18 +176,43 @@ def _write_remote_config(
     device_id: str = "remote-0x0330",
     control_id: str = "0,0",
     topic: str = "zigbee2mqtt/remote/0x0330/action",
+    dedupe_ms: int | None = None,
+    template_id: str = "zigbee-remote",
 ) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
         f"""
 id: {device_id}
 name: Zigbee remote
+template: {template_id}
 remote:
   mqtt:
     topic: {topic}
-  events:
-    - match: off
-      control_id: "{control_id}"
-      event_type: press
+{f"    dedupe_ms: {dedupe_ms}" if dedupe_ms is not None else ""}
+"""
+    )
+    _write_remote_template(
+        path.parent / "templates" / f"{template_id}.yml",
+        template_id=template_id,
+        control_id=control_id,
+    )
+
+
+def _write_remote_template(
+    path: Path,
+    *,
+    template_id: str = "zigbee-remote",
+    control_id: str = "0,0",
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"""
+id: {template_id}
+name: Zigbee remote template
+events:
+  - match: off
+    control_id: "{control_id}"
+    event_type: press
 """
     )
 
@@ -279,27 +305,11 @@ def test_deduper_suppresses_duplicate_actions_within_window():
 def test_load_remote_devices_reads_yaml_config(
     tmp_path: Path,
 ):
-    (tmp_path / "remote.yml").write_text(
-        """
-id: remote-0x0330
-name: Zigbee remote
-remote:
-  mqtt:
-    topic: zigbee2mqtt/remote/0x0330/action
-    dedupe_ms: 300
-  events:
-    - match: off
-      control_id: "0,0"
-      event_type: press
-    - match: brightness_step_up
-      control_id: "3,0"
-      event_type: rotate
-      direction: clockwise
-"""
-    )
+    _write_remote_config(tmp_path / "remote.yml", dedupe_ms=300)
 
     devices = load_remote_devices(
         tmp_path,
+        templates_dir=tmp_path / "templates",
         default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",
             port=1883,
@@ -317,10 +327,12 @@ remote:
 
 
 def test_load_remote_devices_rejects_per_device_broker_override(tmp_path: Path):
+    _write_remote_template(tmp_path / "templates" / "zigbee-remote.yml")
     (tmp_path / "remote.yml").write_text(
         """
 id: remote-0x0330
 name: Zigbee remote
+template: zigbee-remote
 remote:
   mqtt:
     hostname: mqtt-z2m.local
@@ -328,15 +340,12 @@ remote:
     username: z2m
     password: secret
     topic: zigbee2mqtt/remote/0x0330/action
-  events:
-    - match: off
-      control_id: "0,0"
-      event_type: press
 """
     )
 
     devices = load_remote_devices(
         tmp_path,
+        templates_dir=tmp_path / "templates",
         default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",
             port=1883,
@@ -349,25 +358,50 @@ remote:
 
 
 def test_load_remote_devices_rejects_controller_profile_fields(tmp_path: Path):
+    _write_remote_template(tmp_path / "templates" / "zigbee-remote.yml")
     (tmp_path / "remote.yml").write_text(
         """
 id: remote-0x0330
 name: Zigbee remote
+template: zigbee-remote
 profiles:
   - name: default
     pages: []
 remote:
   mqtt:
     topic: zigbee2mqtt/remote/0x0330/action
-  events:
-    - match: off
-      control_id: "0,0"
-      event_type: press
 """
     )
 
     devices = load_remote_devices(
         tmp_path,
+        templates_dir=tmp_path / "templates",
+        default_mqtt=MqttBrokerDefaults(
+            hostname="mqtt-default.local",
+            port=1883,
+            username=None,
+            password=None,
+        ),
+    )
+
+    assert devices == []
+
+
+def test_load_remote_devices_rejects_missing_template(tmp_path: Path):
+    (tmp_path / "remote.yml").write_text(
+        """
+id: remote-0x0330
+name: Zigbee remote
+template: missing-template
+remote:
+  mqtt:
+    topic: zigbee2mqtt/remote/0x0330/action
+"""
+    )
+
+    devices = load_remote_devices(
+        tmp_path,
+        templates_dir=tmp_path / "templates",
         default_mqtt=MqttBrokerDefaults(
             hostname="mqtt-default.local",
             port=1883,
@@ -383,8 +417,10 @@ remote:
 async def test_driver_factory_reads_manager_labels_and_broker_config(tmp_path: Path):
     config_base_dir = tmp_path / "runtime" / "config"
     config_base_dir.mkdir(parents=True)
-    mqtt_config_dir = tmp_path / "runtime" / "mqtt" / "openhabian"
-    mqtt_config_dir.mkdir(parents=True)
+    mqtt_devices_dir = tmp_path / "runtime" / "hardware" / "mqtt" / "openhabian" / "devices"
+    mqtt_templates_dir = tmp_path / "runtime" / "hardware" / "mqtt" / "templates"
+    mqtt_devices_dir.mkdir(parents=True)
+    mqtt_templates_dir.mkdir(parents=True)
 
     async with _deckr() as deckr:
         component = driver_factory(
@@ -393,7 +429,8 @@ async def test_driver_factory_reads_manager_labels_and_broker_config(tmp_path: P
             deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
             manager_id="mqtt-main",
             config={
-                "config_path": "../mqtt/openhabian",
+                "devices_path": "../hardware/mqtt/openhabian/devices",
+                "templates_path": "../hardware/mqtt/templates",
                 "broker": {"hostname": "openhabian", "port": 1884},
                 "labels": {"mqtt-host": "openhabian"},
             },
@@ -403,7 +440,21 @@ async def test_driver_factory_reads_manager_labels_and_broker_config(tmp_path: P
         assert component._default_mqtt.hostname == "openhabian"
         assert component._default_mqtt.port == 1884
         assert component._labels == {"mqtt-host": "openhabian"}
-        assert component._config_dir == mqtt_config_dir
+        assert component._devices_dir == mqtt_devices_dir
+        assert component._templates_dir == mqtt_templates_dir
+
+
+@pytest.mark.asyncio
+async def test_driver_factory_rejects_old_config_path_key(tmp_path: Path):
+    async with _deckr() as deckr:
+        with pytest.raises(ValueError):
+            driver_factory(
+                deckr.lane("hardware_messages"),
+                deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+                deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
+                manager_id="mqtt-main",
+                config={"config_path": str(tmp_path)},
+            )
 
 
 @pytest.mark.asyncio
@@ -411,19 +462,7 @@ async def test_remote_driver_restarts_device_on_config_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     config_path = tmp_path / "remote.yml"
-    config_path.write_text(
-        """
-id: remote-0x0330
-name: Zigbee remote
-remote:
-  mqtt:
-    topic: zigbee2mqtt/remote/0x0330/action
-  events:
-    - match: off
-      control_id: "0,0"
-      event_type: press
-"""
-    )
+    _write_remote_config(config_path)
 
     started_topics: list[str] = []
 
@@ -450,7 +489,8 @@ remote:
             deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
             deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
             manager_id="mqtt-main",
-            config_dir=tmp_path,
+            devices_dir=tmp_path,
+            templates_dir=tmp_path / "templates",
             default_mqtt=MqttBrokerDefaults(
                 hostname="mqtt-default.local",
                 port=1883,
@@ -472,18 +512,10 @@ remote:
             while started_topics != ["zigbee2mqtt/remote/0x0330/action"]:
                 await anyio.sleep(0.05)
 
-        config_path.write_text(
-            """
-id: remote-0x0330
-name: Zigbee remote
-remote:
-  mqtt:
-    topic: zigbee2mqtt/remote/0x0330/action-2
-  events:
-    - match: off
-      control_id: "1,0"
-      event_type: press
-"""
+        _write_remote_config(
+            config_path,
+            topic="zigbee2mqtt/remote/0x0330/action-2",
+            control_id="1,0",
         )
         await component._reconcile_devices()
 
@@ -549,7 +581,8 @@ async def test_inventory_state_unavailable_keeps_configured_device(tmp_path: Pat
             deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
             UnavailableState(),
             manager_id="mqtt-main",
-            config_dir=tmp_path,
+            devices_dir=tmp_path,
+            templates_dir=tmp_path / "templates",
             default_mqtt=MqttBrokerDefaults(
                 hostname="mqtt-default.local",
                 port=1883,

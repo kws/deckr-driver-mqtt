@@ -78,6 +78,8 @@ from ._device import ControlInputEvent, RemoteDevice
 logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path(decouple_config("CONFIG_DIR", default="settings")).resolve()
+DEFAULT_DEVICES_DIR = CONFIG_DIR / "devices"
+DEFAULT_TEMPLATES_DIR = CONFIG_DIR / "templates"
 QOS = 2
 _STATE_RECONCILE_SECONDS = 1.0
 _WATCH_RETRY_SECONDS = 1.0
@@ -110,15 +112,16 @@ class RemoteMqttConfig(_RemoteConfigModel):
     dedupe_ms: int = 250
 
 
-class DriverBrokerConfig(BaseModel):
+class DriverBrokerConfig(_RemoteConfigModel):
     hostname: str = ""
     port: int = 1883
     username: str | None = None
     password: str | None = None
 
 
-class DriverConfig(BaseModel):
-    config_path: Path | None = None
+class DriverConfig(_RemoteConfigModel):
+    devices_path: Path | None = None
+    templates_path: Path | None = None
     broker: DriverBrokerConfig = Field(default_factory=DriverBrokerConfig)
     labels: dict[str, str] = Field(default_factory=dict)
 
@@ -141,15 +144,21 @@ class RemoteEventMapping(_RemoteConfigModel):
         return str(value)
 
 
-class RemoteConfig(_RemoteConfigModel):
+class RemoteDeviceTransportConfig(_RemoteConfigModel):
     mqtt: RemoteMqttConfig
+
+
+class RemoteTemplateConfig(_RemoteConfigModel):
+    id: str
+    name: str | None = None
     events: list[RemoteEventMapping] = Field(default_factory=list)
 
 
 class RemoteDeviceCandidate(_RemoteConfigModel):
     id: str
     name: str
-    remote: RemoteConfig
+    template: str
+    remote: RemoteDeviceTransportConfig
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,12 +449,22 @@ def load_driver_config(
     base_dir: Path | None = None,
 ) -> DriverConfig:
     driver_config = DriverConfig.model_validate(dict(config or {}))
-    config_path = driver_config.config_path or CONFIG_DIR
-    path = Path(config_path).expanduser()
+    driver_config.devices_path = _resolve_config_path(
+        driver_config.devices_path or DEFAULT_DEVICES_DIR,
+        base_dir=base_dir,
+    )
+    driver_config.templates_path = _resolve_config_path(
+        driver_config.templates_path or DEFAULT_TEMPLATES_DIR,
+        base_dir=base_dir,
+    )
+    return driver_config
+
+
+def _resolve_config_path(value: Path | str, *, base_dir: Path | None = None) -> Path:
+    path = Path(value).expanduser()
     if not path.is_absolute() and base_dir is not None:
         path = base_dir / path
-    driver_config.config_path = path.resolve()
-    return driver_config
+    return path.resolve()
 
 
 class Deduper:
@@ -465,6 +484,7 @@ class Deduper:
 def _load_remote_device(
     path: Path,
     *,
+    templates: Mapping[str, RemoteTemplateConfig],
     default_mqtt: MqttBrokerDefaults,
 ) -> RemoteDeviceRuntime | None:
     try:
@@ -482,6 +502,15 @@ def _load_remote_device(
         logger.exception("Invalid remote device config in %s", path)
         return None
 
+    template = templates.get(candidate.template)
+    if template is None:
+        logger.warning(
+            "Skipping remote config %s because template %r is not available",
+            path,
+            candidate.template,
+        )
+        return None
+
     mappings = tuple(
         RuntimeRemoteMapping(
             match=mapping.match,
@@ -489,10 +518,14 @@ def _load_remote_device(
             event_type=mapping.event_type,
             direction=mapping.direction,
         )
-        for mapping in candidate.remote.events
+        for mapping in template.events
     )
     if not mappings:
-        logger.warning("Skipping remote config %s because it has no events", path)
+        logger.warning(
+            "Skipping remote config %s because template %r has no events",
+            path,
+            candidate.template,
+        )
         return None
 
     hostname = default_mqtt.hostname
@@ -519,16 +552,57 @@ def _load_remote_device(
     )
 
 
+def _load_remote_template(path: Path) -> RemoteTemplateConfig | None:
+    try:
+        data = yaml.safe_load(path.read_text())
+    except Exception:
+        logger.exception("Failed to read remote template from %s", path)
+        return None
+
+    try:
+        template = RemoteTemplateConfig.model_validate(data)
+    except Exception:
+        logger.exception("Invalid remote template config in %s", path)
+        return None
+    return template
+
+
+def load_remote_templates(
+    templates_dir: Path = DEFAULT_TEMPLATES_DIR,
+) -> dict[str, RemoteTemplateConfig]:
+    templates: dict[str, RemoteTemplateConfig] = {}
+    for pattern in ("*.yml", "*.yaml"):
+        for path in sorted(templates_dir.glob(pattern)):
+            template = _load_remote_template(path)
+            if template is None:
+                continue
+            if template.id in templates:
+                logger.error(
+                    "Ignoring duplicate remote template id %r in %s",
+                    template.id,
+                    path,
+                )
+                continue
+            templates[template.id] = template
+    return templates
+
+
 def load_remote_devices(
-    config_dir: Path = CONFIG_DIR,
+    devices_dir: Path = DEFAULT_DEVICES_DIR,
     *,
+    templates_dir: Path = DEFAULT_TEMPLATES_DIR,
     default_mqtt: MqttBrokerDefaults | None = None,
 ) -> list[RemoteDeviceRuntime]:
     devices: list[RemoteDeviceRuntime] = []
     mqtt_defaults = default_mqtt or load_mqtt_broker_defaults()
+    templates = load_remote_templates(templates_dir)
     for pattern in ("*.yml", "*.yaml"):
-        for path in sorted(config_dir.glob(pattern)):
-            device = _load_remote_device(path, default_mqtt=mqtt_defaults)
+        for path in sorted(devices_dir.glob(pattern)):
+            device = _load_remote_device(
+                path,
+                templates=templates,
+                default_mqtt=mqtt_defaults,
+            )
             if device is not None:
                 devices.append(device)
     return devices
@@ -709,7 +783,8 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         discovery_state: StateStore,
         *,
         manager_id: str,
-        config_dir: Path = CONFIG_DIR,
+        devices_dir: Path = DEFAULT_DEVICES_DIR,
+        templates_dir: Path = DEFAULT_TEMPLATES_DIR,
         default_mqtt: MqttBrokerDefaults | None = None,
         labels: Mapping[str, str] | None = None,
     ):
@@ -718,7 +793,8 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         self._lease_state = lease_state
         self._discovery_state = discovery_state
         self._manager_id = manager_id
-        self._config_dir = config_dir
+        self._devices_dir = devices_dir
+        self._templates_dir = templates_dir
         self._default_mqtt = default_mqtt or load_mqtt_broker_defaults()
         self._labels = dict(labels or {})
         self._session_id = ""
@@ -821,7 +897,8 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         desired = {
             runtime.id: runtime
             for runtime in load_remote_devices(
-                self._config_dir,
+                self._devices_dir,
+                templates_dir=self._templates_dir,
                 default_mqtt=self._default_mqtt,
             )
         }
@@ -886,9 +963,20 @@ class RemoteDeviceFactoryComponent(BaseComponent):
     async def _watch_loop(self) -> None:
         if self._stop_event is None:
             return
+        watch_paths = tuple(
+            path for path in (self._devices_dir, self._templates_dir) if path.exists()
+        )
+        if not watch_paths:
+            logger.warning(
+                "No MQTT remote config directories exist: %s, %s",
+                self._devices_dir,
+                self._templates_dir,
+            )
+            await self._stop_event.wait()
+            return
         try:
             async for _changes in awatch(
-                self._config_dir,
+                *watch_paths,
                 watch_filter=_yaml_filter,
                 recursive=False,
                 stop_event=self._stop_event,
@@ -1308,7 +1396,8 @@ def driver_factory(
         lease_state,
         discovery_state,
         manager_id=manager_id,
-        config_dir=driver_config.config_path or CONFIG_DIR,
+        devices_dir=driver_config.devices_path or DEFAULT_DEVICES_DIR,
+        templates_dir=driver_config.templates_path or DEFAULT_TEMPLATES_DIR,
         default_mqtt=MqttBrokerDefaults(
             hostname=driver_config.broker.hostname,
             port=driver_config.broker.port,
