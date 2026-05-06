@@ -70,7 +70,7 @@ from deckr.state import (
     presence_endpoint_key,
 )
 from decouple import config as decouple_config
-from pydantic import BaseModel, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from watchfiles import Change, awatch
 
 from ._device import ControlInputEvent, RemoteDevice
@@ -101,11 +101,11 @@ RemoteInputEventType = Literal[
 ]
 
 
-class RemoteMqttConfig(BaseModel):
-    hostname: str | None = None
-    port: int | None = None
-    username: str | None = None
-    password: str | None = None
+class _RemoteConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class RemoteMqttConfig(_RemoteConfigModel):
     topic: str
     dedupe_ms: int = 250
 
@@ -120,9 +120,10 @@ class DriverBrokerConfig(BaseModel):
 class DriverConfig(BaseModel):
     config_path: Path | None = None
     broker: DriverBrokerConfig = Field(default_factory=DriverBrokerConfig)
+    labels: dict[str, str] = Field(default_factory=dict)
 
 
-class RemoteEventMapping(BaseModel):
+class RemoteEventMapping(_RemoteConfigModel):
     match: str
     control_id: str
     event_type: RemoteInputEventType
@@ -140,12 +141,12 @@ class RemoteEventMapping(BaseModel):
         return str(value)
 
 
-class RemoteConfig(BaseModel):
+class RemoteConfig(_RemoteConfigModel):
     mqtt: RemoteMqttConfig
     events: list[RemoteEventMapping] = Field(default_factory=list)
 
 
-class RemoteDeviceCandidate(BaseModel):
+class RemoteDeviceCandidate(_RemoteConfigModel):
     id: str
     name: str
     remote: RemoteConfig
@@ -433,10 +434,17 @@ def load_mqtt_broker_defaults(
     )
 
 
-def load_driver_config(config: Mapping[str, Any] | None = None) -> DriverConfig:
+def load_driver_config(
+    config: Mapping[str, Any] | None = None,
+    *,
+    base_dir: Path | None = None,
+) -> DriverConfig:
     driver_config = DriverConfig.model_validate(dict(config or {}))
     config_path = driver_config.config_path or CONFIG_DIR
-    driver_config.config_path = Path(config_path).expanduser().resolve()
+    path = Path(config_path).expanduser()
+    if not path.is_absolute() and base_dir is not None:
+        path = base_dir / path
+    driver_config.config_path = path.resolve()
     return driver_config
 
 
@@ -487,26 +495,10 @@ def _load_remote_device(
         logger.warning("Skipping remote config %s because it has no events", path)
         return None
 
-    hostname = (
-        candidate.remote.mqtt.hostname.strip()
-        if candidate.remote.mqtt.hostname is not None
-        else default_mqtt.hostname
-    )
-    port = (
-        candidate.remote.mqtt.port
-        if candidate.remote.mqtt.port is not None
-        else default_mqtt.port
-    )
-    username = (
-        candidate.remote.mqtt.username
-        if candidate.remote.mqtt.username is not None
-        else default_mqtt.username
-    )
-    password = (
-        candidate.remote.mqtt.password
-        if candidate.remote.mqtt.password is not None
-        else default_mqtt.password
-    )
+    hostname = default_mqtt.hostname
+    port = default_mqtt.port
+    username = default_mqtt.username
+    password = default_mqtt.password
     if not hostname:
         logger.warning(
             "Skipping remote config %s because no MQTT hostname is configured",
@@ -719,6 +711,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         manager_id: str,
         config_dir: Path = CONFIG_DIR,
         default_mqtt: MqttBrokerDefaults | None = None,
+        labels: Mapping[str, str] | None = None,
     ):
         super().__init__(name="remote_device_factory")
         self._hardware_lane = hardware_lane
@@ -727,6 +720,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
         self._manager_id = manager_id
         self._config_dir = config_dir
         self._default_mqtt = default_mqtt or load_mqtt_broker_defaults()
+        self._labels = dict(labels or {})
         self._session_id = ""
         self._cancel_scope: anyio.CancelScope | None = None
         self._endpoint_cm: (
@@ -957,6 +951,7 @@ class RemoteDeviceFactoryComponent(BaseComponent):
                 managerEndpoint=self._endpoint.endpoint,
                 sessionId=self._session_id,
                 timestamp=datetime.now(UTC),
+                labels=self._labels,
                 devices={
                     device_id: HardwareInventoryDevice(
                         deviceRef=DeviceRef(
@@ -1305,15 +1300,22 @@ def driver_factory(
     *,
     manager_id: str,
     config: Mapping[str, Any] | None = None,
+    config_base_dir: Path | None = None,
 ):
-    driver_config = load_driver_config(config)
+    driver_config = load_driver_config(config, base_dir=config_base_dir)
     return RemoteDeviceFactoryComponent(
         hardware_lane,
         lease_state,
         discovery_state,
         manager_id=manager_id,
         config_dir=driver_config.config_path or CONFIG_DIR,
-        default_mqtt=load_mqtt_broker_defaults(config),
+        default_mqtt=MqttBrokerDefaults(
+            hostname=driver_config.broker.hostname,
+            port=driver_config.broker.port,
+            username=driver_config.broker.username,
+            password=driver_config.broker.password,
+        ),
+        labels=driver_config.labels,
     )
 
 
@@ -1324,6 +1326,7 @@ def component_factory(context: ComponentContext):
         context.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
         manager_id=context.require_endpoint_id("hardware_manager"),
         config=context.config,
+        config_base_dir=context.base_dir,
     )
 
 

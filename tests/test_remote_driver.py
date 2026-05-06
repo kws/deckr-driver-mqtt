@@ -38,6 +38,7 @@ from deckr.drivers.mqtt._factory import (
     _apply_device_commands,
     _extract_action_values,
     build_controls,
+    driver_factory,
     load_remote_devices,
 )
 
@@ -128,6 +129,7 @@ def _factory(deckr: Deckr, config_dir: Path) -> RemoteDeviceFactoryComponent:
             username=None,
             password=None,
         ),
+        labels={"mqtt-host": "mqtt-default.local"},
     )
     manager._endpoint = _endpoint(
         deckr,
@@ -180,7 +182,6 @@ id: {device_id}
 name: Zigbee remote
 remote:
   mqtt:
-    hostname: mqtt-a.local
     topic: {topic}
   events:
     - match: off
@@ -315,7 +316,7 @@ remote:
     assert devices[0].dedupe_ms == 300
 
 
-def test_load_remote_devices_supports_per_device_broker_override(tmp_path: Path):
+def test_load_remote_devices_rejects_per_device_broker_override(tmp_path: Path):
     (tmp_path / "remote.yml").write_text(
         """
 id: remote-0x0330
@@ -344,11 +345,65 @@ remote:
         ),
     )
 
-    assert len(devices) == 1
-    assert devices[0].mqtt_hostname == "mqtt-z2m.local"
-    assert devices[0].mqtt_port == 1884
-    assert devices[0].mqtt_username == "z2m"
-    assert devices[0].mqtt_password == "secret"
+    assert devices == []
+
+
+def test_load_remote_devices_rejects_controller_profile_fields(tmp_path: Path):
+    (tmp_path / "remote.yml").write_text(
+        """
+id: remote-0x0330
+name: Zigbee remote
+profiles:
+  - name: default
+    pages: []
+remote:
+  mqtt:
+    topic: zigbee2mqtt/remote/0x0330/action
+  events:
+    - match: off
+      control_id: "0,0"
+      event_type: press
+"""
+    )
+
+    devices = load_remote_devices(
+        tmp_path,
+        default_mqtt=MqttBrokerDefaults(
+            hostname="mqtt-default.local",
+            port=1883,
+            username=None,
+            password=None,
+        ),
+    )
+
+    assert devices == []
+
+
+@pytest.mark.asyncio
+async def test_driver_factory_reads_manager_labels_and_broker_config(tmp_path: Path):
+    config_base_dir = tmp_path / "runtime" / "config"
+    config_base_dir.mkdir(parents=True)
+    mqtt_config_dir = tmp_path / "runtime" / "mqtt" / "openhabian"
+    mqtt_config_dir.mkdir(parents=True)
+
+    async with _deckr() as deckr:
+        component = driver_factory(
+            deckr.lane("hardware_messages"),
+            deckr.state(DEFAULT_LEASE_STATE_STORE_NAME),
+            deckr.state(DEFAULT_DISCOVERY_STATE_STORE_NAME),
+            manager_id="mqtt-main",
+            config={
+                "config_path": "../mqtt/openhabian",
+                "broker": {"hostname": "openhabian", "port": 1884},
+                "labels": {"mqtt-host": "openhabian"},
+            },
+            config_base_dir=config_base_dir,
+        )
+
+        assert component._default_mqtt.hostname == "openhabian"
+        assert component._default_mqtt.port == 1884
+        assert component._labels == {"mqtt-host": "openhabian"}
+        assert component._config_dir == mqtt_config_dir
 
 
 @pytest.mark.asyncio
@@ -360,13 +415,8 @@ async def test_remote_driver_restarts_device_on_config_change(
         """
 id: remote-0x0330
 name: Zigbee remote
-profiles:
-  - name: default
-    pages:
-      - controls: []
 remote:
   mqtt:
-    hostname: mqtt-a.local
     topic: zigbee2mqtt/remote/0x0330/action
   events:
     - match: off
@@ -426,13 +476,8 @@ remote:
             """
 id: remote-0x0330
 name: Zigbee remote
-profiles:
-  - name: default
-    pages:
-      - controls: []
 remote:
   mqtt:
-    hostname: mqtt-b.local
     topic: zigbee2mqtt/remote/0x0330/action-2
   events:
     - match: off
@@ -466,6 +511,7 @@ async def test_reconcile_devices_publishes_aggregate_inventory(tmp_path: Path):
         )
         assert entry is not None
         inventory = HardwareInventory.model_validate(entry.value)
+        assert inventory.labels == {"mqtt-host": "mqtt-default.local"}
         assert set(inventory.devices) == {"remote-0x0330"}
         assert inventory.devices["remote-0x0330"].descriptor.device_id == "remote-0x0330"
 

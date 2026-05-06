@@ -21,6 +21,7 @@ from deckr.state import (
     StateConflict,
     StateEntry,
     StateStore,
+    StateStorePolicy,
     state_value,
 )
 
@@ -126,7 +127,13 @@ class MemoryLaneSubstrate:
             await send.aclose()
             await receive.aclose()
 
-    def state(self, name: str) -> StateStore:
+    def state(
+        self,
+        name: str = DEFAULT_STATE_STORE_NAME,
+        *,
+        policy: StateStorePolicy | None = None,
+    ) -> StateStore:
+        del policy
         store = self._states.get(name)
         if store is None:
             store = MemoryStateStore(buffer_size=self._buffer_size)
