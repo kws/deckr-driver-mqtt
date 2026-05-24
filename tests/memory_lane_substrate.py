@@ -11,7 +11,6 @@ from deckr.contracts.models import DeckrModel
 from deckr.lanes import (
     ReplyPredicate,
     message_is_deliverable,
-    message_sender_session_is_current,
     reply_is_accepted,
     validate_message_for_contract,
 )
@@ -47,11 +46,6 @@ class MemoryLaneSubstrate:
     async def publish(self, message: DeckrMessage) -> None:
         contract = self._lane_contracts.contract_for(message.lane)
         validate_message_for_contract(message, contract)
-        if not await message_sender_session_is_current(
-            message,
-            state=self.state(self.default_state_name),
-        ):
-            return
         async with self._lock:
             subscribers = [
                 (endpoint, endpoint_session_id, tuple(streams))
