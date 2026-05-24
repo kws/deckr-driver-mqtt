@@ -15,6 +15,7 @@ from deckr.beacon import (
     BEACON_ADVERTISEMENT_STORE_POLICY,
     DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
     BeaconDiscovery,
+    BeaconService,
 )
 from deckr.components import (
     BaseComponent,
@@ -29,6 +30,7 @@ from deckr.concord import (
     DEFAULT_CONCORD_CONTRACT_STORE_NAME,
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
+    ConcordService,
 )
 from deckr.contracts.messages import hardware_manager_address
 from deckr.hardware.descriptors import DeviceConnection, DeviceDescriptor
@@ -192,8 +194,8 @@ class Zigbee2MqttHardwareManager(BaseComponent):
     def __init__(
         self,
         hardware_lane: Lane,
-        beacon: BeaconDiscovery,
-        concord: ConcordCoordinator,
+        beacon: BeaconService,
+        concord: ConcordService,
         *,
         manager_id: str,
         base_topic: str = DEFAULT_BASE_TOPIC,
@@ -465,8 +467,8 @@ def _hardware_device_from_zigbee2mqtt_device(
 
 def driver_factory(
     hardware_lane: Lane,
-    beacon: BeaconDiscovery,
-    concord: ConcordCoordinator,
+    beacon: BeaconService,
+    concord: ConcordService,
     *,
     manager_id: str,
     config: Mapping[str, Any] | None = None,
@@ -488,13 +490,13 @@ def driver_factory(
 def component_factory(context: ComponentContext):
     return driver_factory(
         context.require_lane("hardware_messages"),
-        BeaconDiscovery(
+        BeaconService(BeaconDiscovery(
             context.state(
                 DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
                 policy=BEACON_ADVERTISEMENT_STORE_POLICY,
             )
-        ),
-        ConcordCoordinator(
+        )),
+        ConcordService(ConcordCoordinator(
             context.state(
                 DEFAULT_CONCORD_CONTRACT_STORE_NAME,
                 policy=CONCORD_CONTRACT_STORE_POLICY,
@@ -503,7 +505,7 @@ def component_factory(context: ComponentContext):
                 DEFAULT_CONCORD_TOKEN_STORE_NAME,
                 policy=CONCORD_TOKEN_STORE_POLICY,
             ),
-        ),
+        )),
         manager_id=context.require_endpoint_id("hardware_manager"),
         config=context.config,
         config_base_dir=context.base_dir,

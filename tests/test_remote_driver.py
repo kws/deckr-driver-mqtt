@@ -5,12 +5,17 @@ import json
 import anyio
 import deckr.hardware.messages as hw_messages
 import pytest
-from deckr.beacon import DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME, BeaconDiscovery
+from deckr.beacon import (
+    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
+    BeaconDiscovery,
+    BeaconService,
+)
 from deckr.components import RunContext
 from deckr.concord import (
     DEFAULT_CONCORD_CONTRACT_STORE_NAME,
     DEFAULT_CONCORD_TOKEN_STORE_NAME,
     ConcordCoordinator,
+    ConcordService,
     ContractValidityStatus,
 )
 from deckr.contracts.lanes import CORE_LANE_CONTRACTS, LaneContractRegistry
@@ -50,14 +55,18 @@ def _deckr() -> Deckr:
     )
 
 
-def _beacon(deckr: Deckr) -> BeaconDiscovery:
-    return BeaconDiscovery(deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
+def _beacon(deckr: Deckr) -> BeaconService:
+    return BeaconService(
+        BeaconDiscovery(deckr.state(DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME))
+    )
 
 
-def _concord(deckr: Deckr) -> ConcordCoordinator:
-    return ConcordCoordinator(
-        deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
-        deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+def _concord(deckr: Deckr) -> ConcordService:
+    return ConcordService(
+        ConcordCoordinator(
+            deckr.state(DEFAULT_CONCORD_CONTRACT_STORE_NAME),
+            deckr.state(DEFAULT_CONCORD_TOKEN_STORE_NAME),
+        )
     )
 
 
@@ -92,7 +101,7 @@ def _bridge_devices():
     return parse_bridge_devices(json.dumps([_z2m_device()]))
 
 
-async def _claim(factory, concord: ConcordCoordinator, controller_endpoint):
+async def _claim(factory, concord: ConcordService, controller_endpoint):
     runtime = factory._runtime
     assert runtime is not None
     advertisement = runtime.advertisement
