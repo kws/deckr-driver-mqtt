@@ -104,14 +104,11 @@ def _bridge_devices():
 async def _claim(factory, concord: ConcordService, controller_endpoint):
     runtime = factory._runtime
     assert runtime is not None
-    advertisement = runtime.advertisement
-    assert advertisement is not None
     device = next(iter(factory._runtimes.values()))
     terms = HardwareClaimTerms(
         claimId="claim-1",
         controllerEndpoint=controller_endpoint.endpoint,
         managerEndpoint=hardware_manager_address("mqtt-main"),
-        managerAdvertisementId=advertisement.advertisement_id,
         devices=(
             HardwareClaimDevice(
                 deviceRef=DeviceRef(
