@@ -403,7 +403,6 @@ class Zigbee2MqttHardwareManager(BaseComponent):
         if self._runtime is not None:
             await self._runtime.replace_devices(
                 next_devices,
-                announce=True,
                 removed_reason="removed",
             )
 
