@@ -120,14 +120,14 @@ async def _claim(factory, concord: ConcordService, controller_endpoint):
             ),
         ),
     )
-    contract = await concord.create_contract(
+    contract = await concord._create_contract(
         (controller_endpoint.endpoint, hardware_manager_address("mqtt-main")),
         contract_id="claim-1",
         profile=HARDWARE_CLAIM_PROFILE_ID,
         terms=terms,
         created_by=controller_endpoint.endpoint,
     )
-    await concord.attach(
+    await concord._attach(
         contract,
         controller_endpoint.endpoint,
         controller_endpoint.session_id,
@@ -166,7 +166,7 @@ async def test_mqtt_advertises_hardware_and_routes_claimed_input() -> None:
             assert payload.devices[device.id].descriptor == device.descriptor
 
             contract = await _claim(factory, concord, controller_endpoint)
-            assert (await concord.validate(contract)).status == ContractValidityStatus.VALID
+            assert (await concord._validate(contract)).status == ContractValidityStatus.VALID
 
             async with controller_endpoint.subscribe() as stream:
                 await factory._handle_mqtt_device_payload(
