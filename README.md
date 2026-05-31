@@ -5,13 +5,12 @@ MQTT-backed remote hardware manager for Deckr.
 The manager keeps the existing `deckr.drivers.mqtt` runtime surface and is
 loaded through the normal `deckr.components` entry point group.
 
-Beacon and Concord are the runtime ownership surface. The manager advertises
-inferred Zigbee2MQTT devices through the `dev.deckr.hardware` Beacon feature
-and attaches its participant token to matching
-`dev.deckr.profile.hardware_claim.v1` Concord contracts. Input events are
-routed only while a Concord claim is valid. MQTT action devices are input-only,
-so authorized controller commands are rejected as unsupported rather than
-forwarded to MQTT.
+Beacon advertises inferred Zigbee2MQTT devices as candidates for controller
+claims. The manager attaches its participant token to matching
+`dev.deckr.profile.hardware_claim.v1` Concord contracts, and live claim
+authority is Concord-only after negotiation. Input events are routed only while
+a Concord claim is valid. MQTT action devices are input-only, so authorized
+controller commands are rejected as unsupported rather than forwarded to MQTT.
 
 The manager no longer publishes or consumes legacy discovery inventory,
 endpoint-presence, or unilateral device-claim current-state records.
