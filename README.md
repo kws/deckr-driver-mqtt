@@ -2,8 +2,13 @@
 
 MQTT-backed remote hardware manager for Deckr.
 
-The manager keeps the existing `deckr.drivers.mqtt` runtime surface and is
-loaded through the normal `deckr.components` entry point group.
+The package exposes the hosted Deckr component entry point as
+`deckr.drivers.mqtt:component` and is loaded through the normal
+`deckr.components` entry point group. The runtime uses
+`ComponentContext.open_endpoint("hardware_manager")`,
+`ComponentContext.require_beacon()`, and
+`ComponentContext.require_concord()`; there is no legacy `driver_factory`
+surface.
 
 Beacon advertises inferred Zigbee2MQTT devices as candidates for controller
 claims. The manager attaches its participant token to matching
@@ -14,6 +19,9 @@ controller commands are rejected as unsupported rather than forwarded to MQTT.
 
 The manager no longer publishes or consumes legacy discovery inventory,
 endpoint-presence, or unilateral device-claim current-state records.
+
+If `config.broker.hostname` is omitted, the component stays running and reports
+itself unready instead of attempting an MQTT connection.
 
 Configure one MQTT hardware manager instance per broker. Broker connection
 settings and selection labels live on the component instance:

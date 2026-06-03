@@ -1,3 +1,3 @@
-from ._factory import component, driver_factory
+from ._factory import component
 
-__all__ = ["component", "driver_factory"]
+__all__ = ["component"]

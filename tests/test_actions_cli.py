@@ -4,6 +4,7 @@ import io
 import json
 from datetime import datetime
 
+import deckr.drivers.mqtt as mqtt_package
 from deckr.drivers.mqtt._actions_cli import (
     InspectState,
     action_values_for_observation,
@@ -34,6 +35,12 @@ PAULMANN_50141_ACTIONS = [
     "store",
     "recall",
 ]
+
+
+def test_package_exports_component_only() -> None:
+    assert mqtt_package.__all__ == ["component"]
+    assert hasattr(mqtt_package, "component")
+    assert not hasattr(mqtt_package, "driver_factory")
 
 
 def test_zigbee2mqtt_device_topic_supports_slash_friendly_names() -> None:

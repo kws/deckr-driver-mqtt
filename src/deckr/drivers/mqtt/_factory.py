@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Mapping
-from contextlib import AbstractAsyncContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from time import monotonic
@@ -11,31 +10,16 @@ from typing import Any
 import aiomqtt
 import anyio
 import deckr.hardware.messages as hw_messages
-from deckr.beacon import (
-    BEACON_ADVERTISEMENT_STORE_POLICY,
-    DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
-    BeaconDiscovery,
-    BeaconService,
-)
 from deckr.components import (
     BaseComponent,
     ComponentContext,
     ComponentDefinition,
     ComponentManifest,
+    ReadinessState,
     RunContext,
 )
-from deckr.concord import (
-    CONCORD_CONTRACT_STORE_POLICY,
-    CONCORD_TOKEN_STORE_POLICY,
-    DEFAULT_CONCORD_CONTRACT_STORE_NAME,
-    DEFAULT_CONCORD_TOKEN_STORE_NAME,
-    ConcordCoordinator,
-    ConcordService,
-)
-from deckr.contracts.messages import hardware_manager_address
 from deckr.hardware.descriptors import DeviceConnection, DeviceDescriptor
 from deckr.hardware.runtime import HardwareManagerRuntime
-from deckr.lanes import Lane, RegisteredEndpointLane
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ._zigbee2mqtt import (
@@ -193,70 +177,93 @@ def load_driver_config(
 class Zigbee2MqttHardwareManager(BaseComponent):
     def __init__(
         self,
-        hardware_lane: Lane,
-        beacon: BeaconService,
-        concord: ConcordService,
+        context: ComponentContext,
         *,
-        manager_id: str,
         base_topic: str = DEFAULT_BASE_TOPIC,
         dedupe_ms: int = DEFAULT_DEDUPE_MS,
         broker: DriverBrokerConfig | None = None,
         labels: Mapping[str, str] | None = None,
     ):
-        super().__init__(name="zigbee2mqtt_hardware_manager")
-        self._hardware_lane = hardware_lane
-        self._beacon = beacon
-        self._concord = concord
-        self._manager_id = manager_id
+        super().__init__(name=context.runtime_name)
+        self._context = context
+        self.manager_id = context.require_endpoint_id("hardware_manager")
         self._base_topic = base_topic.strip().strip("/") or DEFAULT_BASE_TOPIC
         self._dedupe_ms = max(dedupe_ms, 0)
         self._broker = broker or DriverBrokerConfig()
         self._labels = dict(labels or {})
-        self._cancel_scope: anyio.CancelScope | None = None
-        self._endpoint_cm: (
-            AbstractAsyncContextManager[RegisteredEndpointLane] | None
-        ) = None
-        self._endpoint: RegisteredEndpointLane | None = None
         self._runtime: HardwareManagerRuntime | None = None
-        self._stop_event: anyio.Event | None = None
+        self._stopping: anyio.Event | None = None
         self._runtimes: dict[str, Zigbee2MqttDeviceRuntime] = {}
         self._runtime_by_topic: dict[str, Zigbee2MqttDeviceRuntime] = {}
 
     async def start(self, ctx: RunContext) -> None:
-        try:
-            self._endpoint_cm = self._hardware_lane.register_endpoint(
-                hardware_manager_address(self._manager_id),
-                metadata={"runtime": "deckr-driver-mqtt-python"},
-                task_group=ctx.tg,
-            )
-            self._endpoint = await self._endpoint_cm.__aenter__()
-            self._cancel_scope = ctx.tg.cancel_scope
-            self._stop_event = anyio.Event()
-            self._runtime = HardwareManagerRuntime(
-                endpoint=self._endpoint,
-                beacon=self._beacon,
-                concord=self._concord,
-                manager_id=self._manager_id,
-                labels=self._labels,
-            )
-            await self._runtime.start(ctx.tg)
-            ctx.tg.start_soon(self._mqtt_discovery_loop)
-        except BaseException:
-            with anyio.CancelScope(shield=True):
-                await self._stop_runtime()
-                await self._close_endpoint()
-            raise
+        self._stopping = ctx.stopping
+        ctx.start_task(self._run, ctx, name=f"{self.name}.mqtt")
 
     async def stop(self) -> None:
+        stopping = self._stopping
+        if stopping is not None:
+            stopping.set()
         with anyio.CancelScope(shield=True):
-            if self._stop_event is not None:
-                self._stop_event.set()
-            if self._cancel_scope is not None:
-                self._cancel_scope.cancel()
             self._runtimes.clear()
             self._runtime_by_topic.clear()
             await self._stop_runtime()
-            await self._close_endpoint()
+
+    async def _run(self, ctx: RunContext) -> None:
+        async with self._context.open_endpoint(
+            "hardware_manager",
+            metadata={"runtime": "deckr-driver-mqtt-python"},
+        ) as endpoint:
+            self.manager_id = endpoint.address.endpoint_id
+            runtime = HardwareManagerRuntime(
+                endpoint=endpoint,
+                beacon=self._context.require_beacon(),
+                concord=self._context.require_concord(),
+                manager_id=self.manager_id,
+                labels=self._labels,
+            )
+            self._runtime = runtime
+            try:
+                await runtime.start(ctx.tg)
+                if self._broker.hostname:
+                    ctx.start_task(
+                        self._mqtt_discovery_loop,
+                        name=f"{self.name}.zigbee2mqtt",
+                    )
+                    await ctx.report_status(
+                        ReadinessState.READY,
+                        diagnostics=self._status_diagnostics(),
+                    )
+                else:
+                    logger.warning(
+                        "MQTT hardware manager %s has no broker hostname configured",
+                        self.manager_id,
+                    )
+                    await ctx.report_status(
+                        ReadinessState.UNREADY,
+                        reasons=("missing_broker_hostname",),
+                        diagnostics=self._status_diagnostics(),
+                    )
+                await ctx.stopping.wait()
+            finally:
+                self._runtimes.clear()
+                self._runtime_by_topic.clear()
+                await self._stop_runtime()
+                await ctx.report_status(
+                    ReadinessState.UNREADY,
+                    reasons=("stopped",),
+                    diagnostics=self._status_diagnostics(),
+                )
+
+    def _status_diagnostics(self) -> dict[str, object]:
+        diagnostics: dict[str, object] = {
+            "manager_id": self.manager_id,
+            "base_topic": self._base_topic,
+        }
+        if self._broker.hostname:
+            diagnostics["broker_hostname"] = self._broker.hostname
+            diagnostics["broker_port"] = self._broker.port
+        return diagnostics
 
     async def _stop_runtime(self) -> None:
         runtime = self._runtime
@@ -264,16 +271,8 @@ class Zigbee2MqttHardwareManager(BaseComponent):
         if runtime is not None:
             await runtime.stop()
 
-    async def _close_endpoint(self) -> None:
-        endpoint_cm = self._endpoint_cm
-        self._endpoint_cm = None
-        self._endpoint = None
-        if endpoint_cm is not None:
-            await endpoint_cm.__aexit__(None, None, None)
-
     async def _mqtt_discovery_loop(self) -> None:
         if not self._broker.hostname:
-            logger.warning("MQTT hardware manager has no broker hostname configured")
             return
 
         backoff = 1.0
@@ -291,7 +290,7 @@ class Zigbee2MqttHardwareManager(BaseComponent):
                     await client.subscribe(bridge_topic, qos=QOS)
                     logger.info(
                         "Zigbee2MQTT manager %s subscribed to %s",
-                        self._manager_id,
+                        self.manager_id,
                         bridge_topic,
                     )
                     backoff = 1.0
@@ -313,7 +312,7 @@ class Zigbee2MqttHardwareManager(BaseComponent):
             except Exception:
                 logger.exception(
                     "Zigbee2MQTT manager %s disconnected; retrying in %.1fs",
-                    self._manager_id,
+                    self.manager_id,
                     backoff,
                 )
                 await anyio.sleep(backoff)
@@ -355,12 +354,13 @@ class Zigbee2MqttHardwareManager(BaseComponent):
         runtime: Zigbee2MqttDeviceRuntime,
         event: ControlInputEvent,
     ) -> None:
-        if self._runtime is None or self._endpoint is None:
+        hardware_runtime = self._runtime
+        if hardware_runtime is None:
             return
-        await self._runtime.handle_hardware_message(
+        await hardware_runtime.handle_hardware_message(
             hw_messages.control_input_message(
-                manager_id=self._manager_id,
-                sender_session_id=self._endpoint.session_id,
+                manager_id=self.manager_id,
+                sender_session_id=hardware_runtime.endpoint.session_id,
                 device_id=runtime.id,
                 fingerprint=runtime.fingerprint,
                 control_id=event.control_id,
@@ -464,50 +464,14 @@ def _hardware_device_from_zigbee2mqtt_device(
     )
 
 
-def driver_factory(
-    hardware_lane: Lane,
-    beacon: BeaconService,
-    concord: ConcordService,
-    *,
-    manager_id: str,
-    config: Mapping[str, Any] | None = None,
-    config_base_dir: Path | None = None,
-):
-    driver_config = load_driver_config(config, base_dir=config_base_dir)
+def component_factory(context: ComponentContext) -> Zigbee2MqttHardwareManager:
+    driver_config = load_driver_config(context.config, base_dir=context.base_dir)
     return Zigbee2MqttHardwareManager(
-        hardware_lane,
-        beacon,
-        concord,
-        manager_id=manager_id,
+        context,
         base_topic=driver_config.base_topic,
         dedupe_ms=driver_config.dedupe_ms,
         broker=driver_config.broker,
         labels=driver_config.labels,
-    )
-
-
-def component_factory(context: ComponentContext):
-    return driver_factory(
-        context.require_lane("hardware_messages"),
-        BeaconService(BeaconDiscovery(
-            context.state(
-                DEFAULT_BEACON_ADVERTISEMENT_STORE_NAME,
-                policy=BEACON_ADVERTISEMENT_STORE_POLICY,
-            )
-        )),
-        ConcordService(ConcordCoordinator(
-            context.state(
-                DEFAULT_CONCORD_CONTRACT_STORE_NAME,
-                policy=CONCORD_CONTRACT_STORE_POLICY,
-            ),
-            context.state(
-                DEFAULT_CONCORD_TOKEN_STORE_NAME,
-                policy=CONCORD_TOKEN_STORE_POLICY,
-            ),
-        )),
-        manager_id=context.require_endpoint_id("hardware_manager"),
-        config=context.config,
-        config_base_dir=context.base_dir,
     )
 
 
