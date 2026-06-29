@@ -194,7 +194,7 @@ async def _claim(factory, concord, controller_endpoint):
         controller_endpoint.session_id,
     )
     await concord.wait_current()
-    await runtime.reconcile_claims(reason="test")
+    await runtime._reconcile_claims(reason="test")
     return contract
 
 
@@ -260,7 +260,7 @@ async def test_claimed_input_is_routed_and_authorized_commands_are_unsupported()
                 command_type="noop",
             )
             deckr._message_bus.publish_reply.reset_mock()
-            assert not await runtime.handle_command(command)
+            assert not await runtime._handle_command(command)
             rejected = deckr._message_bus.publish_reply.call_args.args[0]
             rejection = hw_messages.hardware_body_from_message(rejected)
             assert isinstance(rejection, hw_messages.CommandRejectedMessage)
