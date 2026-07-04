@@ -232,6 +232,24 @@ async def test_claimed_input_is_routed_and_authorized_commands_are_unsupported()
         device = next(iter(factory._runtimes.values()))
 
         async with deckr.endpoint(controller_address("controller-main")) as controller:
+            unauthorized = hw_messages.control_command_message(
+                controller_id="controller-main",
+                sender_session_id=controller.session_id,
+                manager_id="mqtt-main",
+                device_id=device.id,
+                control_id="on",
+                capability_id="button.press",
+                command_type="noop",
+                recipient_session_id=runtime.endpoint.session_id,
+                contract={"contractId": "unauthorized-claim", "generation": 1},
+            )
+            deckr._message_bus.publish_reply.reset_mock()
+            assert not await runtime._handle_command(unauthorized)
+            rejected = deckr._message_bus.publish_reply.call_args.args[0]
+            rejection = hw_messages.hardware_body_from_message(rejected)
+            assert isinstance(rejection, hw_messages.CommandRejectedMessage)
+            assert rejection.reason == "unauthorized"
+
             contract = await _claim(factory, deckr.concord, controller)
             assert (await deckr.concord._validate(contract)).status == (
                 ContractValidityStatus.VALID
@@ -258,6 +276,8 @@ async def test_claimed_input_is_routed_and_authorized_commands_are_unsupported()
                 control_id="on",
                 capability_id="button.press",
                 command_type="noop",
+                recipient_session_id=runtime.endpoint.session_id,
+                contract={"contractId": "claim-1", "generation": 1},
             )
             deckr._message_bus.publish_reply.reset_mock()
             assert not await runtime._handle_command(command)
