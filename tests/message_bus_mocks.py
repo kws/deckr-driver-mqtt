@@ -15,6 +15,7 @@ from deckr.substrates.nats_kv import (
     KvChange,
     KvConflict,
     KvEntry,
+    KvWatchBarrier,
     kv_value,
 )
 
@@ -32,7 +33,9 @@ class MemoryJsonKvBucket:
         self._ttl_seconds = ttl_seconds
         self._revision = 0
         self._entries: dict[str, KvEntry] = {}
-        self._watchers: dict[anyio.abc.ObjectSendStream[KvChange | None], str] = {}
+        self._watchers: dict[
+            anyio.abc.ObjectSendStream[KvChange | KvWatchBarrier], str
+        ] = {}
         self._lock = anyio.Lock()
 
     async def ttl_seconds(self) -> float | None:
@@ -114,12 +117,17 @@ class MemoryJsonKvBucket:
     async def watch(
         self,
         prefix: str = "",
-    ) -> AsyncIterator[anyio.abc.ObjectReceiveStream[KvChange | None]]:
-        send, receive = anyio.create_memory_object_stream[KvChange | None](
+    ) -> AsyncIterator[
+        anyio.abc.ObjectReceiveStream[KvChange | KvWatchBarrier]
+    ]:
+        send, receive = anyio.create_memory_object_stream[
+            KvChange | KvWatchBarrier
+        ](
             max_buffer_size=self._buffer_size
         )
         async with self._lock:
             self._watchers[send] = prefix
+            high_water_revision = self._revision
             snapshot = tuple(
                 entry
                 for key, entry in sorted(self._entries.items())
@@ -129,7 +137,7 @@ class MemoryJsonKvBucket:
             await send.send(
                 KvChange(self.bucket, entry.key, entry.revision, "put", entry)
             )
-        await send.send(None)
+        await send.send(KvWatchBarrier(high_water_revision))
         try:
             async with send, receive:
                 yield receive
@@ -141,7 +149,10 @@ class MemoryJsonKvBucket:
         self,
         key: str,
         value: Mapping[str, Any] | DeckrModel,
-    ) -> tuple[KvEntry, tuple[anyio.abc.ObjectSendStream[KvChange | None], ...]]:
+    ) -> tuple[
+        KvEntry,
+        tuple[anyio.abc.ObjectSendStream[KvChange | KvWatchBarrier], ...],
+    ]:
         normalized = kv_value(value)
         async with self._lock:
             self._revision += 1
@@ -153,14 +164,16 @@ class MemoryJsonKvBucket:
     def _watchers_for(
         self,
         key: str,
-    ) -> tuple[anyio.abc.ObjectSendStream[KvChange | None], ...]:
+    ) -> tuple[anyio.abc.ObjectSendStream[KvChange | KvWatchBarrier], ...]:
         return tuple(
             stream for stream, prefix in self._watchers.items() if key.startswith(prefix)
         )
 
     async def _publish(
         self,
-        watchers: tuple[anyio.abc.ObjectSendStream[KvChange | None], ...],
+        watchers: tuple[
+            anyio.abc.ObjectSendStream[KvChange | KvWatchBarrier], ...
+        ],
         change: KvChange,
     ) -> None:
         for watcher in watchers:
