@@ -187,14 +187,26 @@ async def _claim(factory, concord, controller_endpoint):
         profile=HARDWARE_CLAIM_PROFILE_ID,
         terms=terms,
         created_by=controller_endpoint.address,
+        participant_sessions={
+            str(runtime.endpoint.address): runtime.endpoint.session_id,
+        },
     )
     await concord._attach(
         contract,
         controller_endpoint.address,
         controller_endpoint.session_id,
     )
-    await concord.wait_current()
-    await runtime._reconcile_claims(reason="test")
+    await runtime._claim_manager.notify_policy_changed()
+    with anyio.fail_after(2):
+        while (
+            (await concord._validate(contract)).status
+            != ContractValidityStatus.VALID
+            or not any(
+                claim.contract.pointer == contract.pointer
+                for claim in runtime.live_claims
+            )
+        ):
+            await anyio.sleep(0)
     return contract
 
 

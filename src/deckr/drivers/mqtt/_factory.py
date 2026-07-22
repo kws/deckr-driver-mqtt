@@ -207,7 +207,6 @@ class Zigbee2MqttHardwareManager(BaseComponent):
         with anyio.CancelScope(shield=True):
             self._runtimes.clear()
             self._runtime_by_topic.clear()
-            await self._stop_runtime()
 
     async def _run(self, ctx: RunContext) -> None:
         async with self._context.open_endpoint(
@@ -215,45 +214,43 @@ class Zigbee2MqttHardwareManager(BaseComponent):
             metadata={"runtime": "deckr-driver-mqtt-python"},
         ) as endpoint:
             self.manager_id = endpoint.address.endpoint_id
-            runtime = HardwareManagerRuntime(
-                endpoint=endpoint,
-                beacon=self._context.require_beacon(),
-                concord=self._context.require_concord(),
+            manager = self._context.hardware_manager(
+                endpoint,
                 manager_id=self.manager_id,
                 labels=self._labels,
             )
-            self._runtime = runtime
-            try:
-                await runtime.start(ctx.tg)
-                if self._broker.hostname:
-                    ctx.start_task(
-                        self._mqtt_discovery_loop,
-                        name=f"{self.name}.zigbee2mqtt",
-                    )
-                    await ctx.report_status(
-                        ReadinessState.READY,
-                        diagnostics=self._status_diagnostics(),
-                    )
-                else:
-                    logger.warning(
-                        "MQTT hardware manager %s has no broker hostname configured",
-                        self.manager_id,
-                    )
+            async with manager as runtime:
+                self._runtime = runtime
+                try:
+                    if self._broker.hostname:
+                        ctx.start_task(
+                            self._mqtt_discovery_loop,
+                            name=f"{self.name}.zigbee2mqtt",
+                        )
+                        await ctx.report_status(
+                            ReadinessState.READY,
+                            diagnostics=self._status_diagnostics(),
+                        )
+                    else:
+                        logger.warning(
+                            "MQTT hardware manager %s has no broker hostname configured",
+                            self.manager_id,
+                        )
+                        await ctx.report_status(
+                            ReadinessState.UNREADY,
+                            reasons=("missing_broker_hostname",),
+                            diagnostics=self._status_diagnostics(),
+                        )
+                    await ctx.stopping.wait()
+                finally:
+                    self._runtimes.clear()
+                    self._runtime_by_topic.clear()
+                    self._runtime = None
                     await ctx.report_status(
                         ReadinessState.UNREADY,
-                        reasons=("missing_broker_hostname",),
+                        reasons=("stopped",),
                         diagnostics=self._status_diagnostics(),
                     )
-                await ctx.stopping.wait()
-            finally:
-                self._runtimes.clear()
-                self._runtime_by_topic.clear()
-                await self._stop_runtime()
-                await ctx.report_status(
-                    ReadinessState.UNREADY,
-                    reasons=("stopped",),
-                    diagnostics=self._status_diagnostics(),
-                )
 
     def _status_diagnostics(self) -> dict[str, object]:
         diagnostics: dict[str, object] = {
@@ -264,12 +261,6 @@ class Zigbee2MqttHardwareManager(BaseComponent):
             diagnostics["broker_hostname"] = self._broker.hostname
             diagnostics["broker_port"] = self._broker.port
         return diagnostics
-
-    async def _stop_runtime(self) -> None:
-        runtime = self._runtime
-        self._runtime = None
-        if runtime is not None:
-            await runtime.stop()
 
     async def _mqtt_discovery_loop(self) -> None:
         if not self._broker.hostname:
