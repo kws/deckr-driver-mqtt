@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any
 
@@ -111,7 +112,12 @@ def _bridge_devices(*devices: dict[str, Any]):
 async def _running_component(config: dict[str, Any] | None = None):
     plan = resolve_component_host_plan(
         _document(config),
-        definitions={"dev.deckr.hardware.mqtt": factory_module.component},
+        definitions={
+            entry.name: entry.load()
+            for entry in entry_points(
+                group="deckr.components", name="dev.deckr.hardware.mqtt"
+            )
+        },
     )
     deckr_cm = mock_deckr(
         lane_contracts=plan.lane_contracts,
@@ -199,12 +205,9 @@ async def _claim(factory, concord, controller_endpoint):
     await runtime._claim_manager.notify_policy_changed()
     with anyio.fail_after(2):
         while (
-            (await concord._validate(contract)).status
-            != ContractValidityStatus.VALID
-            or not any(
-                claim.contract.pointer == contract.pointer
-                for claim in runtime.live_claims
-            )
+            await concord._validate(contract)
+        ).status != ContractValidityStatus.VALID or not any(
+            claim.contract.pointer == contract.pointer for claim in runtime.live_claims
         ):
             await anyio.sleep(0)
     return contract
@@ -237,13 +240,19 @@ async def test_component_starts_hosted_unready_without_broker_and_advertises_lab
 
 
 async def test_claimed_input_is_routed_and_authorized_commands_are_unsupported():
-    async with _running_component() as (deckr, _host, factory):
+    async with _running_component({"dedupe_ms": 0}) as (deckr, _host, factory):
         await factory._reconcile_discovered_devices(_bridge_devices())
         runtime = factory._runtime
         assert runtime is not None
         device = next(iter(factory._runtimes.values()))
 
         async with deckr.endpoint(controller_address("controller-main")) as controller:
+            deckr._message_bus.publish.reset_mock()
+            await factory._handle_mqtt_device_payload(
+                topic=device.topic, payload='{"action":"on"}'
+            )
+            deckr._message_bus.publish.assert_not_called()
+
             unauthorized = hw_messages.control_command_message(
                 controller_id="controller-main",
                 sender_session_id=controller.session_id,
@@ -298,6 +307,20 @@ async def test_claimed_input_is_routed_and_authorized_commands_are_unsupported()
             assert isinstance(rejection, hw_messages.CommandRejectedMessage)
             assert rejection.reason == "unsupported"
 
+            await deckr.concord._cancel(contract, controller.address, reason="test")
+            await runtime._reconcile_claims(reason="test cancel")
+            deckr._message_bus.publish.reset_mock()
+            await factory._handle_mqtt_device_payload(
+                topic=device.topic, payload='{"action":"on"}'
+            )
+            deckr._message_bus.publish.assert_not_called()
+            assert not await runtime._handle_command(command)
+            rejected = deckr._message_bus.publish_reply.call_args.args[0]
+            assert (
+                hw_messages.hardware_body_from_message(rejected).reason
+                == "unauthorized"
+            )
+
 
 async def test_device_removal_cancels_live_claim_contract():
     async with _running_component() as (deckr, _host, factory):
@@ -350,7 +373,9 @@ async def test_bridge_payload_reconciles_mqtt_subscriptions_and_ignores_invalid_
         assert client.unsubscribed == ["zigbee2mqtt/remote/0x0330"]
 
 
-async def test_dedupe_and_directional_stop_mapping_are_per_device():
+async def test_dedupe_expires_and_directional_stop_releases_active_control(monkeypatch):
+    now = 100.0
+    monkeypatch.setattr(factory_module, "monotonic", lambda: now)
     runtime = factory_module._runtime_from_zigbee2mqtt_device(
         _bridge_devices()[0],
         dedupe_ms=50,
@@ -361,7 +386,7 @@ async def test_dedupe_and_directional_stop_mapping_are_per_device():
         "press"
     ]
     assert runtime.events_for_payload('"on"') == ()
-    await anyio.sleep(0.06)
+    now += 0.06
     assert [event.event_type for event in runtime.events_for_payload('"on"')] == [
         "press"
     ]
@@ -382,3 +407,33 @@ async def test_dedupe_and_directional_stop_mapping_are_per_device():
         ("brightness_down", "down"),
         ("brightness_down", "up"),
     ]
+
+
+async def test_devices_keep_independent_input_state_across_inventory_refresh():
+    first = _z2m_device()
+    second = _z2m_device(friendly_name="remote/second")
+    second["ieee_address"] = "0xffffaa6712730331"
+    devices = _bridge_devices(first, second)
+    async with _running_component({"dedupe_ms": 60000}) as (_, _, factory):
+        await factory._reconcile_discovered_devices(devices)
+        a, b = (factory._runtimes[device.device_id] for device in devices)
+        assert [event.event_type for event in a.events_for_payload('"on"')] == ["press"]
+        assert [event.event_type for event in b.events_for_payload('"on"')] == ["press"]
+        assert a.events_for_payload('"on"') == b.events_for_payload('"on"') == ()
+
+        a.events_for_payload('"brightness_move_up"')
+        b.events_for_payload('"brightness_move_down"')
+        await factory._reconcile_discovered_devices(devices)
+        a, b = (factory._runtimes[device.device_id] for device in devices)
+
+        assert a.events_for_payload('"on"') == b.events_for_payload('"on"') == ()
+        assert [
+            (event.control_id, event.event_type)
+            for event in a.events_for_payload('"brightness_stop"')
+        ] == [("brightness_up", "up")]
+        assert [
+            (event.control_id, event.event_type)
+            for event in b.events_for_payload('"brightness_stop"')
+        ] == [("brightness_down", "up")]
+        assert a.events_for_payload('"brightness_stop"') == ()
+        assert b.events_for_payload('"brightness_stop"') == ()
