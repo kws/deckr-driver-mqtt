@@ -40,6 +40,7 @@ dev = [
 ]
 
 [tool.uv.sources]
+# The workspace maps the deckr distribution to ../deckr-core-python.
 deckr = { workspace = true }
 
 [tool.hatch.build.targets.wheel]

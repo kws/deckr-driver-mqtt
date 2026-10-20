@@ -18,8 +18,8 @@ from deckr.components import (
     ReadinessState,
     RunContext,
 )
+from deckr.hardware import HardwareManagerRuntime
 from deckr.hardware.descriptors import DeviceConnection, DeviceDescriptor
-from deckr.hardware.runtime import HardwareManagerRuntime
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ._zigbee2mqtt import (

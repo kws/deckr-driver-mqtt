@@ -70,11 +70,24 @@ capabilities.
 
 ## Development
 
-Build a local `deckr` wheel first:
+The `deckr` Python distribution now comes from the sibling
+[`deckr-core-python`](https://github.com/kws/deckr-core-python) repository.
+Check it out next to this repository at the revision in `.deckr-core-revision`. In the parent workspace, run
+`uv sync --all-packages --all-groups`, then the repository-local checks:
 
 ```bash
-cd ../deckr && uv build --wheel
-cd ../deckr-driver-mqtt
-uv sync --dev --find-links ../deckr/dist
-uv run --find-links ../deckr/dist pytest
+uv run --no-sync ruff check .
+uv run --no-sync pytest
 ```
+
+For standalone development, build a wheel from the separated core and install
+it without the parent workspace source override:
+
+```bash
+(cd ../deckr-core-python && uv build --wheel)
+uv sync --no-sources --dev --find-links ../deckr-core-python/dist
+uv run --no-sync pytest
+```
+
+Runtime imports remain under `deckr`; the reference-only `deckr` repository is
+not a Python package dependency.
