@@ -32,7 +32,7 @@ jobs:
         run: cd ../deckr-core-python && uv build --wheel
 
       - name: Install dependencies
-        run: uv sync --no-sources --dev --find-links ../deckr-core-python/dist
+        run: uv sync --locked --no-sources --dev --find-links ../deckr-core-python/dist
 
       - name: Run unit tests with coverage
         run: uv run --no-sync pytest --cov=src --cov-report=term-missing --cov-report=xml

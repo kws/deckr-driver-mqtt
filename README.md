@@ -85,7 +85,7 @@ it without the parent workspace source override:
 
 ```bash
 (cd ../deckr-core-python && uv build --wheel)
-uv sync --no-sources --dev --find-links ../deckr-core-python/dist
+uv sync --locked --no-sources --dev --find-links ../deckr-core-python/dist
 uv run --no-sync pytest
 ```
 
